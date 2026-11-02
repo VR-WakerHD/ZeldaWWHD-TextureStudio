@@ -13,6 +13,7 @@ licence file). Upscaler tools and models are downloaded by the user from the off
 | image_dds | 0.7.2 | MIT | BC1–BC5 encode (Intel ISPC via intel_tex_2) and decode (bcdec_rs) |
 | intel_tex_2 | 0.5 | MIT/Apache-2.0 | BC encoder (precompiled ISPC kernels shipped in the crate) |
 | bcdec_rs | 0.2 | MIT | BC decoder |
+| xxhash-rust | 0.8 | BSL-1.0 | texture keys: XXH3-64 of level-0 guest bytes (same hash the recomp uses at run time) |
 | blake3 | 1.8 | CC0-1.0 OR Apache-2.0 | content hashes |
 | rayon | 1.12 | MIT OR Apache-2.0 | parallel scan/extract/export |
 | serde / serde_json | 1.0 | MIT OR Apache-2.0 | manifests, settings |

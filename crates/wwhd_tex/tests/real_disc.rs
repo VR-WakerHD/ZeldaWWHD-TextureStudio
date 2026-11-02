@@ -114,3 +114,44 @@ fn bfres_replacement_reads_back() {
         }
     }
 }
+
+/// The key hash of `level0_bytes` equals the hash of the image slice read back from the archive by an independent
+/// path (a fresh extract of the leaf), for the first 20 decodable textures: guards the slicing the recomp must match.
+#[test]
+fn runtime_keys_fixture() {
+    use wwhd_tex::runtime_pack::{key_hash, level0_bytes};
+    let Some(d) = disc() else { return };
+    let mut checked = 0;
+    'files: for f in SAMPLES {
+        let raw = std::fs::read(d.join(f)).unwrap();
+        let mut found = Vec::new();
+        container::walk(
+            f,
+            &raw,
+            &mut |loc, kind, leaf| {
+                for t in texture::list(&loc, kind, leaf).unwrap() {
+                    if t.surface.depth > 1 || texture::decode(&t, leaf).is_err() {
+                        continue;
+                    }
+                    let (image, _) = texture::raw_data(&t, leaf).unwrap();
+                    found.push((loc.inner.clone(), kind, t.clone(), key_hash(level0_bytes(image, &t.surface))));
+                }
+            },
+            &mut |_, _, _| {},
+            &mut |loc, e| panic!("{}: {e}", loc.display()),
+        );
+        for (inner, kind, t, hash) in found {
+            let leaf = if inner.is_empty() { raw.clone() } else { container::extract_leaf(&raw, &inner).unwrap() };
+            let (image, _) = texture::raw_data(&t, &leaf).unwrap();
+            let size = t.surface.image_size as usize;
+            assert!(image.len() >= size, "{}: image data shorter than image_size", t.id.key());
+            assert_eq!(hash, key_hash(&image[..size]), "{} ({kind:?})", t.id.key());
+            assert_ne!(hash, key_hash(&[]), "{} hashed nothing", t.id.key());
+            checked += 1;
+            if checked == 20 {
+                break 'files;
+            }
+        }
+    }
+    assert_eq!(checked, 20);
+}

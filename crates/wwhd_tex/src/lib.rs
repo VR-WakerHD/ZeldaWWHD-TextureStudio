@@ -15,6 +15,7 @@ pub mod pipeline;
 pub mod policy;
 pub mod project;
 pub mod resample;
+pub mod runtime_pack;
 pub mod sarc;
 pub mod texture;
 pub mod upscale;
