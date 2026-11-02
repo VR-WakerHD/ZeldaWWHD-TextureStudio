@@ -1,0 +1,2 @@
+# Upscaler releases are kept byte-for-byte as published (no line-ending conversion)
+tools/upscalers/** -text
