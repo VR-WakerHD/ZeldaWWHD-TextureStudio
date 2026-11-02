@@ -243,7 +243,9 @@ impl App {
     fn upscaled_path(&self, i: usize) -> Option<PathBuf> {
         let (p, inv) = (self.project.as_ref()?, self.inv.as_ref()?);
         let pl = &self.plans[i];
-        pl.upscales().then(|| p.upscaled_path(&pl.backend.key(), &inv.textures[i].key, pl.scale))
+        let (key, hash) = (pl.backend.key(), &inv.textures[i].key);
+        // A run that stepped down left its result at a lower scale.
+        pl.upscales().then(|| pipeline::find_upscaled(p, &key, hash, pl.scale).map_or_else(|| p.upscaled_path(&key, hash, pl.scale), |(path, _)| path))
     }
 
     fn apply_filter(&mut self) {

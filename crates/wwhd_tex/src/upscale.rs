@@ -111,12 +111,48 @@ impl BackendChoice {
             BackendChoice::RealCugan { .. } => vec![2, 3, 4],
         }
     }
+    /// The passes (run scale, kept scale) that produce `want`. Conventional
+    /// filters do it in one step at any scale; so does a wanted scale that is
+    /// not a power of two (one run at the nearest native scale).
+    pub fn passes(&self, want: u32) -> Vec<(u32, u32)> {
+        if !self.is_ai() || !want.is_power_of_two() {
+            return vec![(if self.is_ai() { self.run_scale(want) } else { want }, want)];
+        }
+        let plan = pass_plan(&self.native_scales(), want);
+        if plan.is_empty() { vec![(self.run_scale(want), want)] } else { plan }
+    }
     /// The scale to run the model at for a wanted scale; the result is then
     /// reduced with Lanczos if larger.
     fn run_scale(&self, want: u32) -> u32 {
         let s = self.native_scales();
         s.iter().copied().find(|&x| x >= want).unwrap_or(*s.last().unwrap())
     }
+}
+
+/// Passes that reach `want` (a power of two) with a model whose native scales
+/// are `native`: each entry is (run scale, kept scale). Greedy: the largest
+/// native power-of-two scale not above what is left, with x4 preferred when the
+/// model has it; when the model has nothing that small (a x4-only model for the
+/// last x2) it runs the smallest larger scale and keeps a Lanczos-reduced
+/// result, e.g. `(4, 2)`.
+pub fn pass_plan(native: &[u32], want: u32) -> Vec<(u32, u32)> {
+    let pow2: Vec<u32> = native.iter().copied().filter(|n| *n >= 2 && n.is_power_of_two()).collect();
+    let mut left = want;
+    let mut plan = Vec::new();
+    while left >= 2 && !pow2.is_empty() {
+        let fits: Vec<u32> = pow2.iter().copied().filter(|&n| n <= left).collect();
+        let run = if fits.contains(&4) {
+            4
+        } else if let Some(&m) = fits.iter().max() {
+            m
+        } else {
+            *pow2.iter().min().unwrap()
+        };
+        let kept = run.min(left);
+        plan.push((run, kept));
+        left /= kept;
+    }
+    plan
 }
 
 /// Locations of the ncnn executables and models.
@@ -203,7 +239,7 @@ pub fn run(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path
                 Output { w: nw, h: nh, rgba: resample::resize_rgba8(j.w, j.h, &j.rgba, nw, nh, *f, j.edge) }
             })
             .collect(),
-        _ => run_ncnn(b, tools, gpu, tile, scratch, jobs, cancel)?,
+        _ => run_ncnn_passes(b, tools, gpu, tile, scratch, jobs, cancel)?,
     };
     // Recombine with conventionally resized alpha.
     Ok(jobs
@@ -228,7 +264,34 @@ pub fn run(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path
         .collect())
 }
 
-fn run_ncnn(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path, jobs: &[Job], cancel: &AtomicBool) -> Result<Vec<Output>> {
+/// Run a model as many passes as each job's wanted scale needs (x32 with a
+/// x4-only model is x4, x4, then x4 reduced to x2). Jobs sharing a wanted scale
+/// go through each pass together; every pass pads and crops on its own.
+fn run_ncnn_passes(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path, jobs: &[Job], cancel: &AtomicBool) -> Result<Vec<Output>> {
+    let mut results: Vec<Option<Output>> = (0..jobs.len()).map(|_| None).collect();
+    let mut scales: Vec<u32> = jobs.iter().map(|j| j.scale).collect();
+    scales.sort_unstable();
+    scales.dedup();
+    for want in scales {
+        let idx: Vec<usize> = (0..jobs.len()).filter(|&i| jobs[i].scale == want).collect();
+        let mut cur: Vec<Output> = idx.iter().map(|&i| Output { w: jobs[i].w, h: jobs[i].h, rgba: jobs[i].rgba.clone() }).collect();
+        for (run, kept) in b.passes(want) {
+            let pass: Vec<Job> = idx
+                .iter()
+                .zip(cur)
+                .map(|(&i, o)| Job { name: jobs[i].name.clone(), w: o.w, h: o.h, rgba: o.rgba, scale: kept, edge: jobs[i].edge })
+                .collect();
+            cur = run_ncnn(b, tools, gpu, tile, scratch, &pass, cancel, run)?;
+        }
+        for (&i, o) in idx.iter().zip(cur) {
+            results[i] = Some(o);
+        }
+    }
+    Ok(results.into_iter().map(|o| o.expect("every job belongs to a scale group")).collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_ncnn(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path, jobs: &[Job], cancel: &AtomicBool, run_scale: u32) -> Result<Vec<Output>> {
     let Some(exe) = tools.exe(b) else {
         bail!("{} is not installed in {}", b.label(), tools.dir.display());
     };
@@ -239,8 +302,6 @@ fn run_ncnn(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Pat
     std::fs::create_dir_all(&in_dir)?;
     std::fs::create_dir_all(&out_dir)?;
 
-    // All jobs of one batch must share a run scale.
-    let run_scale = jobs.iter().map(|j| b.run_scale(j.scale)).max().unwrap_or(4);
     let mut padded = Vec::with_capacity(jobs.len());
     for (i, j) in jobs.iter().enumerate() {
         let m = PAD.min(j.w).min(j.h);
@@ -379,6 +440,25 @@ mod tests {
             let y = p[1] as f32 / 255.0 * 2.0 - 1.0;
             assert!(x * x + y * y <= 1.02);
         }
+    }
+
+    #[test]
+    fn pass_plans() {
+        assert_eq!(pass_plan(&[4], 32), [(4, 4), (4, 4), (4, 2)]);
+        assert_eq!(pass_plan(&[2, 4], 8), [(4, 4), (2, 2)]);
+        assert_eq!(pass_plan(&[2], 8), [(2, 2), (2, 2), (2, 2)]);
+        assert_eq!(pass_plan(&[4], 2), [(4, 2)]);
+        assert_eq!(pass_plan(&[4], 16), [(4, 4), (4, 4)]);
+        assert_eq!(pass_plan(&[2, 3, 4], 4), [(4, 4)]);
+        // Powers of two only; a x3 native scale is never chosen.
+        assert_eq!(pass_plan(&[2, 3], 4), [(2, 2), (2, 2)]);
+        assert!(pass_plan(&[4], 1).is_empty());
+    }
+
+    #[test]
+    fn filters_run_in_one_step() {
+        assert_eq!(BackendChoice::Filter(Filter::Lanczos3).passes(32), [(32, 32)]);
+        assert_eq!(BackendChoice::RealEsrgan("realesrgan-x4plus".into()).passes(32), [(4, 4), (4, 4), (4, 2)]);
     }
 
     #[test]

@@ -166,12 +166,34 @@ pub fn extract(p: &Project, inv: &mut Inventory, progress: &Progress) -> Result<
 pub struct UpscaleMeta {
     pub backend: BackendChoice,
     pub used: BackendChoice,
+    /// The scale of the file this record sits next to (the achieved scale).
     pub scale: u32,
+    /// The scale the plan asked for; 0 in records written before step-down.
+    #[serde(default)]
+    pub wanted: u32,
+    /// The scale actually reached; 0 in records written before step-down
+    /// (use [`UpscaleMeta::achieved_scale`]).
+    #[serde(default)]
+    pub achieved: u32,
+    /// One entry per scale that failed, e.g. "x16 failed consistency (19.3 dB) → x8".
+    #[serde(default)]
+    pub steps: Vec<String>,
     pub seconds: f32,
     pub note: String,
     /// PSNR of the result shrunk back to the source size against the source.
     #[serde(default)]
     pub consistency_db: f32,
+}
+
+impl UpscaleMeta {
+    /// The scale reached; an old record without the field achieved its file's scale.
+    pub fn achieved_scale(&self) -> u32 {
+        if self.achieved == 0 { self.scale } else { self.achieved }
+    }
+    /// The scale that was asked for.
+    pub fn wanted_scale(&self) -> u32 {
+        if self.wanted == 0 { self.achieved_scale() } else { self.wanted }
+    }
 }
 
 /// AI results that do not shrink back to roughly the source are broken
@@ -191,6 +213,25 @@ fn meta_path(png: &Path) -> PathBuf {
 
 pub fn load_meta(png: &Path) -> Option<UpscaleMeta> {
     serde_json::from_slice(&std::fs::read(meta_path(png)).ok()?).ok()
+}
+
+/// The cached upscale for a planned (backend, texture, scale): the file at the
+/// planned scale, or the step-down result a run for that scale recorded in a
+/// lower-scale file's `.json`. Returns the PNG and the scale it really has.
+pub fn find_upscaled(p: &Project, backend_key: &str, hash: &str, scale: u32) -> Option<(PathBuf, u32)> {
+    let planned = p.upscaled_path(backend_key, hash, scale);
+    if planned.exists() {
+        return Some((planned, scale));
+    }
+    let mut n = scale / 2;
+    while n >= 2 {
+        let path = p.upscaled_path(backend_key, hash, n);
+        if path.exists() && load_meta(&path).is_some_and(|m| m.wanted == scale && m.achieved_scale() == n) {
+            return Some((path, n));
+        }
+        n /= 2;
+    }
+    None
 }
 
 /// Effective backend for a class: normal maps and ramps never go to AI models.
@@ -225,7 +266,7 @@ pub fn upscale_tasks(inv: &Inventory, plans: &[Plan], filter: impl Fn(usize) -> 
 /// Stage 2: upscale tasks whose results are not cached yet.
 pub fn upscale(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, tasks: &[UpscaleTask], progress: &Progress) -> Result<()> {
     let tools = Tools { dir: s.tools_dir.clone() };
-    let todo: Vec<&UpscaleTask> = tasks.iter().filter(|t| !p.upscaled_path(&t.backend.key(), &t.key, t.scale).exists()).collect();
+    let todo: Vec<&UpscaleTask> = tasks.iter().filter(|t| find_upscaled(p, &t.backend.key(), &t.key, t.scale).is_none()).collect();
     progress.begin("Upscaling", tasks.len());
     progress.steps(tasks.len() - todo.len());
     let scratch = p.root.join("cache/tmp");
@@ -267,24 +308,23 @@ pub fn upscale(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, tasks:
                     Err(e) => progress.fail(format!("{}: master missing ({e}); run Extract first", rec.id.key())),
                 }
             }
-            let (results, used, note) = run_with_recovery(&backend, &tools, s, &scratch, &jobs, &tasks_ok, inv, d, progress)?;
+            let results = run_with_recovery(&backend, &tools, s, &scratch, &jobs, &tasks_ok, inv, d, progress)?;
             let secs = started.elapsed().as_secs_f32() / tasks_ok.len().max(1) as f32;
-            for ((t, mut out), j) in tasks_ok.iter().zip(results).zip(&jobs) {
-                debug_assert_eq!(out.w, j.w * t.scale);
-                let path = p.upscaled_path(&t.backend.key(), &t.key, t.scale);
-                let mut used = used.clone();
-                let mut note = note.clone();
-                let mut q = consistency(j.w, j.h, &j.rgba, out.w, out.h, &out.rgba);
-                if q < MIN_CONSISTENCY_DB && used.is_ai() {
-                    progress.log(format!("{}: {} output failed the consistency check ({q:.1} dB); using Lanczos-3", j.name, used.label()));
-                    let lanczos = BackendChoice::Filter(Filter::Lanczos3);
-                    out = upscale::run(&lanczos, &tools, s.gpu, 0, &scratch, std::slice::from_ref(j), progress.cancel_flag())?.remove(0);
-                    q = consistency(j.w, j.h, &j.rgba, out.w, out.h, &out.rgba);
-                    note = format!("{} failed consistency check; Lanczos-3 used", used.label());
-                    used = lanczos;
-                }
-                let meta = UpscaleMeta { backend: t.backend.clone(), used, scale: t.scale, seconds: secs, note, consistency_db: q };
-                match save_png(&path, out.w, out.h, &out.rgba).and_then(|_| write_atomic(&meta_path(&path), &serde_json::to_vec(&meta)?)) {
+            for (t, r) in tasks_ok.iter().zip(results) {
+                debug_assert_eq!(r.out.w % r.achieved, 0);
+                let path = p.upscaled_path(&t.backend.key(), &t.key, r.achieved);
+                let meta = UpscaleMeta {
+                    backend: t.backend.clone(),
+                    used: r.used,
+                    scale: r.achieved,
+                    wanted: t.scale,
+                    achieved: r.achieved,
+                    steps: r.steps,
+                    seconds: secs,
+                    note: r.note,
+                    consistency_db: r.consistency_db,
+                };
+                match save_png(&path, r.out.w, r.out.h, &r.out.rgba).and_then(|_| write_atomic(&meta_path(&path), &serde_json::to_vec(&meta)?)) {
                     Ok(()) => progress.step(),
                     Err(e) => progress.fail(format!("{}: {e}", t.key)),
                 }
@@ -295,8 +335,25 @@ pub fn upscale(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, tasks:
     Ok(())
 }
 
+/// One upscaled texture and how it came about.
+struct Recovered {
+    out: upscale::Output,
+    used: BackendChoice,
+    /// The scale `out` has (the planned scale unless the run stepped down).
+    achieved: u32,
+    consistency_db: f32,
+    steps: Vec<String>,
+    note: String,
+}
+
+/// Runs a backend over a batch with a tile size; the seam that lets tests
+/// replace the ncnn tools.
+type RunFn<'a> = &'a dyn Fn(&BackendChoice, u32, &[upscale::Job]) -> Result<Vec<upscale::Output>>;
+
 /// Run a batch; on failure retry with a small tile size (VRAM), then one by
-/// one, then fall back to Lanczos-3 and record why.
+/// one. A texture whose model run fails, or whose result does not shrink back
+/// to the source (< 22 dB), steps down: the same model at half the scale, until
+/// x2; only then Lanczos-3 at the planned scale. Every step is recorded.
 #[allow(clippy::too_many_arguments)]
 fn run_with_recovery(
     backend: &BackendChoice,
@@ -308,61 +365,126 @@ fn run_with_recovery(
     inv: &Inventory,
     d: &Decisions,
     progress: &Progress,
-) -> Result<(Vec<upscale::Output>, BackendChoice, String)> {
-    let normal: Vec<bool> = tasks.iter().map(|t| d.classification(&inv.textures[t.record]).class == Class::NormalMap).collect();
-    let finish = |outs: Vec<upscale::Output>| -> Vec<upscale::Output> {
-        outs.into_iter()
-            .zip(jobs)
-            .zip(&normal)
-            .zip(tasks)
-            .map(|(((o, j), &is_n), t)| {
-                if !is_n {
-                    return o;
-                }
-                let f = inv.textures[t.record].surface.format;
-                let two = gx2::codec(f).map(|c| c == gx2::Codec::Bc5).unwrap_or(false);
-                let filter = match backend {
-                    BackendChoice::Filter(f) => *f,
-                    _ => Filter::CatmullRom,
-                };
-                upscale::Output {
-                    w: o.w,
-                    h: o.h,
-                    // image_dds hands SNORM data over unsigned-mapped (0..255), like UNORM.
-                    rgba: upscale::upscale_normal_map(j.w, j.h, &j.rgba, j.scale, two, false, filter),
-                }
-            })
-            .collect()
+) -> Result<Vec<Recovered>> {
+    let finish = |i: usize, o: upscale::Output| -> upscale::Output {
+        let t = tasks[i];
+        if d.classification(&inv.textures[t.record]).class != Class::NormalMap {
+            return o;
+        }
+        let f = inv.textures[t.record].surface.format;
+        let two = gx2::codec(f).map(|c| c == gx2::Codec::Bc5).unwrap_or(false);
+        let filter = match backend {
+            BackendChoice::Filter(f) => *f,
+            _ => Filter::CatmullRom,
+        };
+        upscale::Output {
+            w: o.w,
+            h: o.h,
+            // image_dds hands SNORM data over unsigned-mapped (0..255), like UNORM.
+            rgba: upscale::upscale_normal_map(jobs[i].w, jobs[i].h, &jobs[i].rgba, jobs[i].scale, two, false, filter),
+        }
     };
+    let run = |b: &BackendChoice, tile: u32, js: &[upscale::Job]| upscale::run(b, tools, s.gpu, tile, scratch, js, progress.cancel_flag());
+    recover(backend, tools.available(backend), s.tile, &run, &finish, jobs, &|m| progress.log(m))
+}
+
+fn recover(
+    backend: &BackendChoice,
+    available: bool,
+    tile: u32,
+    run: RunFn,
+    finish: &dyn Fn(usize, upscale::Output) -> upscale::Output,
+    jobs: &[upscale::Job],
+    log: &dyn Fn(String),
+) -> Result<Vec<Recovered>> {
     let lanczos = BackendChoice::Filter(Filter::Lanczos3);
-    if !tools.available(backend) {
-        let o = upscale::run(&lanczos, tools, s.gpu, s.tile, scratch, jobs, progress.cancel_flag())?;
-        return Ok((finish(o), lanczos, format!("{} not installed", backend.label())));
+    let q_of = |j: &upscale::Job, o: &upscale::Output| consistency(j.w, j.h, &j.rgba, o.w, o.h, &o.rgba);
+    if !available {
+        let outs = run(&lanczos, 0, jobs)?;
+        return Ok(outs
+            .into_iter()
+            .enumerate()
+            .zip(jobs)
+            .map(|((i, o), j)| {
+                let o = finish(i, o);
+                let q = q_of(j, &o);
+                Recovered { out: o, used: lanczos.clone(), achieved: j.scale, consistency_db: q, steps: vec![], note: format!("{} not installed", backend.label()) }
+            })
+            .collect());
     }
-    match upscale::run(backend, tools, s.gpu, s.tile, scratch, jobs, progress.cancel_flag()) {
-        Ok(o) => return Ok((finish(o), backend.clone(), String::new())),
+    // Whole batch first (tile as set, then 128); failing that, image by image below.
+    let mut note = String::new();
+    let mut batch = match run(backend, tile, jobs) {
+        Ok(o) => Some(o),
         Err(Error::Cancelled) => return Err(Error::Cancelled),
-        Err(e) => progress.log(format!("{} batch failed ({e}); retrying with tile 128", backend.label())),
+        Err(e) => {
+            log(format!("{} batch failed ({e}); retrying with tile 128", backend.label()));
+            None
+        }
+    };
+    if batch.is_none() {
+        if let Ok(o) = run(backend, 128, jobs) {
+            batch = Some(o);
+            note = "retried with tile 128".into();
+        }
     }
-    if let Ok(o) = upscale::run(backend, tools, s.gpu, 128, scratch, jobs, progress.cancel_flag()) {
-        return Ok((finish(o), backend.clone(), "retried with tile 128".into()));
-    }
-    let mut outs = Vec::new();
-    let mut fell_back = 0;
-    for j in jobs {
-        let single = std::slice::from_ref(j);
-        match upscale::run(backend, tools, s.gpu, 64, scratch, single, progress.cancel_flag()) {
-            Ok(mut o) => outs.push(o.remove(0)),
+    let mut batch = batch.map(|b| b.into_iter());
+    let mut results = Vec::with_capacity(jobs.len());
+    for (i, j) in jobs.iter().enumerate() {
+        let first = match batch.as_mut() {
+            Some(it) => Ok(it.next().expect("one output per job")),
+            None => {
+                note = "processed one by one".into();
+                run(backend, 64, std::slice::from_ref(j)).map(|mut o| o.remove(0))
+            }
+        };
+        let mut why = match first {
+            Ok(o) => {
+                let o = finish(i, o);
+                let q = q_of(j, &o);
+                if q >= MIN_CONSISTENCY_DB || !backend.is_ai() {
+                    results.push(Recovered { out: o, used: backend.clone(), achieved: j.scale, consistency_db: q, steps: vec![], note: note.clone() });
+                    continue;
+                }
+                format!("consistency ({q:.1} dB)")
+            }
             Err(Error::Cancelled) => return Err(Error::Cancelled),
-            Err(e) => {
-                progress.log(format!("{}: {} failed ({e}); using Lanczos-3", j.name, backend.label()));
-                fell_back += 1;
-                outs.push(upscale::run(&lanczos, tools, s.gpu, 0, scratch, single, progress.cancel_flag())?.remove(0));
+            Err(e) => format!("({e})"),
+        };
+        // Step down: same model, half the scale, down to x2; then Lanczos-3 at the planned scale.
+        let mut steps = Vec::new();
+        let mut n = j.scale;
+        loop {
+            if n / 2 < 2 {
+                steps.push(format!("x{n} failed {why} → Lanczos-3 x{}", j.scale));
+                log(format!("{}: {} {}", j.name, backend.label(), steps.last().unwrap()));
+                let o = run(&lanczos, 0, std::slice::from_ref(j))?.remove(0);
+                let q = q_of(j, &o);
+                let note = format!("{} failed at every scale; Lanczos-3 used", backend.label());
+                results.push(Recovered { out: o, used: lanczos.clone(), achieved: j.scale, consistency_db: q, steps, note });
+                break;
+            }
+            steps.push(format!("x{n} failed {why} → x{}", n / 2));
+            log(format!("{}: {} {}", j.name, backend.label(), steps.last().unwrap()));
+            n /= 2;
+            // Only models step down, and models never get normal-map treatment, so no `finish`.
+            let lower = upscale::Job { name: j.name.clone(), w: j.w, h: j.h, rgba: j.rgba.clone(), scale: n, edge: j.edge };
+            match run(backend, 64, std::slice::from_ref(&lower)) {
+                Ok(mut o) => {
+                    let o = o.remove(0);
+                    let q = q_of(j, &o);
+                    if q >= MIN_CONSISTENCY_DB {
+                        results.push(Recovered { out: o, used: backend.clone(), achieved: n, consistency_db: q, steps, note: note.clone() });
+                        break;
+                    }
+                    why = format!("consistency ({q:.1} dB)");
+                }
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => why = format!("({e})"),
             }
         }
     }
-    let note = if fell_back > 0 { format!("{fell_back} fell back to Lanczos-3") } else { "processed one by one".into() };
-    Ok((finish(outs), backend.clone(), note))
+    Ok(results)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -433,7 +555,8 @@ fn masked(rgba: &[u8], ch: [bool; 4]) -> Vec<u8> {
 fn build_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, i: usize, plan: &Plan) -> Result<(bfres::TextureReplacement, f32)> {
     let t = &inv.textures[i];
     let class = d.classification(t).class;
-    let png = p.upscaled_path(&plan.backend.key(), &t.key, plan.scale);
+    // The scale the upscale really reached (it may have stepped down from the plan).
+    let (png, scale) = find_upscaled(p, &plan.backend.key(), &t.key, plan.scale).ok_or_else(|| Error::Format("upscaled image missing".into()))?;
     let png_bytes = std::fs::read(&png).map_err(|e| Error::Format(format!("upscaled image missing: {e}")))?;
     // Encoded surfaces are cached by everything that determines them, including
     // the upscaled image's bytes, so shared textures encode once.
@@ -441,7 +564,7 @@ fn build_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, i: usize
     h.update(b"encode-v1");
     h.update(&png_bytes);
     h.update(t.key.as_bytes());
-    h.update(format!("{class:?}{}{}{:?}", plan.scale, s.debug_tint, t.surface).as_bytes());
+    h.update(format!("{class:?}{}{}{:?}", scale, s.debug_tint, t.surface).as_bytes());
     let cache_key = h.finalize().to_hex().to_string();
     let cache_path = p.encoded_path(&cache_key);
     if let Some(hit) = load_encoded(&cache_path, t) {
@@ -455,10 +578,10 @@ fn build_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, i: usize
             px[1] /= 3;
         }
     }
-    if (w, h) != (t.surface.width * plan.scale, t.surface.height * plan.scale) {
-        bail!("upscaled image is {w}x{h}, expected x{}", plan.scale);
+    if (w, h) != (t.surface.width * scale, t.surface.height * scale) {
+        bail!("upscaled image is {w}x{h}, expected x{scale}");
     }
-    let count = mips::upscaled_mip_count(t.surface.mip_count, plan.scale);
+    let count = mips::upscaled_mip_count(t.surface.mip_count, scale);
     let mode = mip_mode(class, t.surface.format, &rgba);
     let levels = mips::chain(w, h, rgba, count, mode);
     let rep = texture::build_replacement(&info_of(t), &levels)?;
@@ -527,7 +650,7 @@ pub fn export(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progres
         if r.status == ReviewStatus::Rejected || (r.status == ReviewStatus::Pending && !s.export_unreviewed) {
             continue;
         }
-        if !p.upscaled_path(&pl.backend.key(), &t.key, pl.scale).exists() {
+        if find_upscaled(p, &pl.backend.key(), &t.key, pl.scale).is_none() {
             report.textures_skipped.push(format!("{}: not upscaled yet", t.id.key()));
             continue;
         }
@@ -578,7 +701,7 @@ pub fn export(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progres
                         let t = &inv.textures[i];
                         match build_one(p, s, inv, d, i, &plans[i]) {
                             Ok((rep, q)) if q >= MIN_PSNR => {
-                                let meta = load_meta(&p.upscaled_path(&plans[i].backend.key(), &t.key, plans[i].scale));
+                                let meta = find_upscaled(p, &plans[i].backend.key(), &t.key, plans[i].scale).and_then(|(png, _)| load_meta(&png));
                                 file_entries.push(ReplacementEntry {
                                     source_file: file.clone(),
                                     archive_path: inner.clone(),
@@ -814,4 +937,147 @@ fn validate_file(file: &str, old: &[u8], new: &[u8], replace: &BTreeMap<Vec<Stri
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    fn job(scale: u32) -> upscale::Job {
+        let rgba: Vec<u8> = (0..64).flat_map(|i| [(i * 4) as u8, (255 - i * 4) as u8, (i * 2) as u8, 255]).collect();
+        upscale::Job { name: "t".into(), w: 8, h: 8, rgba, scale, edge: Edge::Wrap }
+    }
+
+    /// Stand-in for the ncnn tools: the model fails or returns garbage at the
+    /// scales listed, and is a faithful nearest-neighbour upscale otherwise.
+    /// Conventional filters run for real. Records the scales it was asked for.
+    struct Stub {
+        fail: Vec<u32>,
+        garbage: Vec<u32>,
+        asked: RefCell<Vec<u32>>,
+    }
+    impl Stub {
+        fn new(fail: &[u32], garbage: &[u32]) -> Self {
+            Stub { fail: fail.to_vec(), garbage: garbage.to_vec(), asked: RefCell::new(vec![]) }
+        }
+        fn run(&self, b: &BackendChoice, _tile: u32, js: &[upscale::Job]) -> Result<Vec<upscale::Output>> {
+            if !b.is_ai() {
+                let tools = Tools { dir: PathBuf::new() };
+                return upscale::run(b, &tools, 0, 0, Path::new("."), js, &std::sync::atomic::AtomicBool::new(false));
+            }
+            let sc = js.iter().map(|j| j.scale).max().unwrap();
+            self.asked.borrow_mut().push(sc);
+            if self.fail.contains(&sc) {
+                return Err(Error::Format(format!("out of memory at x{sc}")));
+            }
+            Ok(js
+                .iter()
+                .map(|j| {
+                    let (w, h) = (j.w * j.scale, j.h * j.scale);
+                    let mut rgba = Vec::new();
+                    for y in 0..h {
+                        for x in 0..w {
+                            let px = if self.garbage.contains(&j.scale) {
+                                [255, 0, 255, 255]
+                            } else {
+                                let k = (((y / j.scale) * j.w + x / j.scale) * 4) as usize;
+                                [j.rgba[k], j.rgba[k + 1], j.rgba[k + 2], j.rgba[k + 3]]
+                            };
+                            rgba.extend_from_slice(&px);
+                        }
+                    }
+                    upscale::Output { w, h, rgba }
+                })
+                .collect())
+        }
+    }
+
+    fn go(stub: &Stub, jobs: &[upscale::Job]) -> Vec<Recovered> {
+        let backend = BackendChoice::Custom("stub".into());
+        let run = |b: &BackendChoice, t: u32, js: &[upscale::Job]| stub.run(b, t, js);
+        recover(&backend, true, 0, &run, &|_, o| o, jobs, &|_| {}).unwrap()
+    }
+
+    #[test]
+    fn model_failure_steps_down_instead_of_using_lanczos() {
+        let stub = Stub::new(&[32, 16], &[]);
+        let r = go(&stub, &[job(32)]).remove(0);
+        assert_eq!(r.achieved, 8);
+        assert_eq!((r.out.w, r.out.h), (64, 64));
+        assert!(matches!(r.used, BackendChoice::Custom(_)), "the model, not Lanczos");
+        assert_eq!(r.steps.len(), 2);
+        assert!(r.steps[0].starts_with("x32 failed (") && r.steps[0].ends_with("→ x16"), "{:?}", r.steps);
+        assert!(r.steps[1].starts_with("x16 failed (") && r.steps[1].ends_with("→ x8"), "{:?}", r.steps);
+        assert_eq!(*stub.asked.borrow(), [32, 32, 32, 16, 8], "batch, tile 128, one by one, then down");
+    }
+
+    #[test]
+    fn consistency_failure_steps_down() {
+        let stub = Stub::new(&[], &[16]);
+        let r = go(&stub, &[job(16)]).remove(0);
+        assert_eq!(r.achieved, 8);
+        assert_eq!(r.steps.len(), 1);
+        assert!(r.steps[0].starts_with("x16 failed consistency (") && r.steps[0].ends_with(" dB) → x8"), "{:?}", r.steps);
+        assert!(r.consistency_db >= MIN_CONSISTENCY_DB);
+    }
+
+    #[test]
+    fn model_failing_everywhere_ends_in_lanczos_at_the_planned_scale() {
+        let stub = Stub::new(&[2, 4, 8, 16, 32], &[]);
+        let r = go(&stub, &[job(32)]).remove(0);
+        assert_eq!(r.achieved, 32);
+        assert_eq!((r.out.w, r.out.h), (256, 256));
+        assert_eq!(r.used, BackendChoice::Filter(Filter::Lanczos3));
+        assert_eq!(r.steps.len(), 5);
+        assert!(r.steps[4].ends_with("→ Lanczos-3 x32"), "{:?}", r.steps);
+    }
+
+    #[test]
+    fn success_records_no_steps_and_each_texture_steps_down_on_its_own() {
+        let stub = Stub::new(&[], &[]);
+        let r = go(&stub, &[job(4)]).remove(0);
+        assert_eq!((r.achieved, r.steps.len()), (4, 0));
+        // x8 is garbage, x4 fine: only the x8 texture steps down.
+        let stub = Stub::new(&[], &[8]);
+        let r = go(&stub, &[job(4), job(8)]);
+        assert_eq!((r[0].achieved, r[1].achieved), (4, 4));
+        assert_eq!((r[0].steps.len(), r[1].steps.len()), (0, 1));
+    }
+
+    #[test]
+    fn a_stepped_down_result_is_found_for_the_scale_that_was_planned() {
+        let root = std::env::temp_dir().join(format!("wwhd-find-upscaled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let p = Project { root: root.clone() };
+        let hash = "ab".repeat(16);
+        let (be, png) = ("custom-x", p.upscaled_path("custom-x", &hash, 8));
+        std::fs::create_dir_all(png.parent().unwrap()).unwrap();
+        std::fs::write(&png, b"png").unwrap();
+        // No record: a lone x8 file is an x8 result, not an answer for x32.
+        assert_eq!(find_upscaled(&p, be, &hash, 8), Some((png.clone(), 8)));
+        assert_eq!(find_upscaled(&p, be, &hash, 32), None);
+        let meta = UpscaleMeta {
+            backend: BackendChoice::Custom("x".into()),
+            used: BackendChoice::Custom("x".into()),
+            scale: 8,
+            wanted: 32,
+            achieved: 8,
+            steps: vec!["x32 failed (oom) → x16".into(), "x16 failed (oom) → x8".into()],
+            seconds: 0.0,
+            note: String::new(),
+            consistency_db: 40.0,
+        };
+        std::fs::write(meta_path(&png), serde_json::to_vec(&meta).unwrap()).unwrap();
+        assert_eq!(find_upscaled(&p, be, &hash, 32), Some((png.clone(), 8)));
+        assert_eq!(find_upscaled(&p, be, &hash, 16), None, "recorded for x32 only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn old_records_without_step_fields_read_as_achieved_at_their_scale() {
+        let old = r#"{"backend":{"Filter":"Lanczos3"},"used":{"Filter":"Lanczos3"},"scale":4,"seconds":1.0,"note":"","consistency_db":30.0}"#;
+        let m: UpscaleMeta = serde_json::from_str(old).unwrap();
+        assert_eq!((m.achieved_scale(), m.wanted_scale()), (4, 4));
+    }
 }
