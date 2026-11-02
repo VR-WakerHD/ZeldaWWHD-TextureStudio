@@ -128,7 +128,9 @@ Contents changed to something not in the map → the replacement is dropped; the
 ### 4. Creating the replacement (render thread, frame start)
 
 At the start of each frame, under the surface lock, finished loads are turned into images (bounded by a byte
-budget per frame, default 64 MiB, so a burst of new textures spreads over frames):
+budget per frame, default 16 MiB and about 1 ms of render-thread time, whichever comes first, with one staging
+buffer per replacement rather than one per level, so a burst of new textures spreads over frames without dropping
+VR frames; reduced from 64 MiB after review, 2026-11-02):
 
 - `s->replacement`: a `Surface` owned by the guest surface (as `mipChain` is), with extent ×scale, `mips` =
   DDS levels (at most 15 at 16384 px, within the renderer's 16-level arrays), host format from the DDS, `sx = sy = scale`, `lodOffset = log2(scale)`, `gpuWritten = false`, and the
