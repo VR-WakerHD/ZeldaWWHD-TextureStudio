@@ -11,12 +11,16 @@ use eframe::egui::{self, Color32, RichText, Sense, Vec2};
 use wwhd_tex::classify::{Class, ALL_CLASSES};
 use wwhd_tex::inventory::{self, Inventory, TextureRecord};
 use wwhd_tex::jobs::Progress;
+use wwhd_tex::mods_dir::Env;
 use wwhd_tex::pipeline::{self, ExportReport, UpscaleTask};
 use wwhd_tex::policy::{self, Decisions, Plan, Review, ReviewStatus};
-use wwhd_tex::project::{Project, ScanScope, Settings};
+use wwhd_tex::project::{Project, ScaleChoice, ScanScope, Settings, SCALES};
 use wwhd_tex::resample::Filter;
+use wwhd_tex::runtime_pack::{self, RuntimeReport};
 use wwhd_tex::upscale::{self, BackendChoice, Tools};
 
+use crate::cli::{self, InstallKind};
+use crate::derived::{self, EnvInfo, Estimate, Found, FoundCache};
 use crate::images::ImageCache;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -81,7 +85,11 @@ impl StatusFilter {
 enum Msg {
     Inventory(Inventory),
     Exported(ExportReport),
-    Installed(Vec<String>),
+    RuntimeExported(RuntimeReport),
+    /// Package ids installed and the install's warnings.
+    Installed(Vec<String>, Vec<String>),
+    /// The upscaled-file scan finished.
+    Found(derived::ScanResult),
     Done(String),
     Failed(String),
 }
@@ -92,6 +100,13 @@ pub struct App {
     inv: Option<Arc<Inventory>>,
     decisions: Decisions,
     plans: Vec<Plan>,
+    /// The plans the runtime pack uses (no per-archive budget, no excluded archives).
+    rt_plans: Vec<Plan>,
+    estimate: Estimate,
+    /// The cached upscale of each planned texture (see `derived::FoundCache`).
+    found: FoundCache,
+    /// Settings changed since the plans and estimates were last worked out; the user presses Refresh estimates.
+    settings_stale: bool,
     /// Index into `inv.textures` of one record per unique key, in display order.
     unique: Vec<usize>,
     filtered: Vec<usize>,
@@ -112,17 +127,22 @@ pub struct App {
     log_seen: usize,
     log: Vec<String>,
     last_report: Option<ExportReport>,
-    mods_root: String,
+    runtime_report: Option<RuntimeReport>,
+    /// Mods folder, game executable and disc folder checks; re-read when `env_dirty`.
+    env_info: Option<EnvInfo>,
+    env_dirty: bool,
     install_confirm: bool,
+    /// An install waits for the user to agree to create the missing mods folder.
+    create_confirm: Option<InstallKind>,
+    install_warnings: Vec<String>,
+    compare_scale: u32,
+    /// Per selected model: its cached result for the comparison scale, and the run's time/notes for the label.
+    compare_found: Vec<(BackendChoice, Found, String)>,
+    compare_for: Option<(usize, u32)>,
+    compare_dirty: bool,
     status: String,
     filter_dirty: bool,
     thumb_size: f32,
-}
-
-fn default_mods_root() -> String {
-    std::env::var("APPDATA").map(|a| format!("{a}\\wwhd\\ModManager")).unwrap_or_else(|_| {
-        std::env::var("HOME").map(|h| format!("{h}/.config/wwhd/ModManager")).unwrap_or_default()
-    })
 }
 
 impl App {
@@ -150,6 +170,10 @@ impl App {
             inv: None,
             decisions: Decisions::default(),
             plans: Vec::new(),
+            rt_plans: Vec::new(),
+            estimate: Estimate::default(),
+            found: FoundCache::default(),
+            settings_stale: false,
             unique: Vec::new(),
             filtered: Vec::new(),
             progress: Progress::default(),
@@ -169,8 +193,16 @@ impl App {
             log_seen: 0,
             log: Vec::new(),
             last_report: None,
-            mods_root: default_mods_root(),
+            runtime_report: None,
+            env_info: None,
+            env_dirty: true,
             install_confirm: false,
+            create_confirm: None,
+            install_warnings: Vec::new(),
+            compare_scale: 4,
+            compare_found: Vec::new(),
+            compare_for: None,
+            compare_dirty: true,
             status: "Choose a project folder to start.".into(),
             filter_dirty: true,
             thumb_size: 96.0,
@@ -199,6 +231,9 @@ impl App {
                 self.log_seen = 0;
                 self.inv = Inventory::load(&p.inventory_path()).ok().map(Arc::new);
                 self.last_report = std::fs::read(p.reports_dir().join("export_report.json")).ok().and_then(|d| serde_json::from_slice(&d).ok());
+                self.runtime_report = std::fs::read(p.reports_dir().join("runtime_export_report.json")).ok().and_then(|d| serde_json::from_slice(&d).ok());
+                self.env_dirty = true;
+                self.install_warnings.clear();
                 let _ = std::fs::write(last_project_file(), dir.to_string_lossy().as_bytes());
                 self.status = match &self.inv {
                     Some(i) => format!("Project loaded: {} textures from {}", i.textures.len(), i.root),
@@ -211,11 +246,19 @@ impl App {
         }
     }
 
+    /// Save the settings. The plans and estimates are not worked out again (a slider drag would redo them every
+    /// frame): they are marked out of date until the user presses Refresh estimates.
     fn save_settings(&mut self) {
         if let Some(p) = &self.project {
             let _ = p.save_settings(&self.settings);
         }
-        self.recompute();
+        self.settings_stale = true;
+        self.env_dirty = true;
+    }
+
+    /// The disc folder chosen is not the one the inventory was scanned from.
+    fn rescan_needed(&self) -> bool {
+        self.inv.as_ref().is_some_and(|i| i.root != self.settings.disc_root.to_string_lossy())
     }
 
     fn save_decisions(&mut self) {
@@ -228,24 +271,51 @@ impl App {
     }
 
     fn recompute(&mut self) {
-        let Some(inv) = &self.inv else {
+        self.settings_stale = false;
+        let Some(inv) = self.inv.clone() else {
             self.plans.clear();
+            self.rt_plans.clear();
             self.unique.clear();
             self.filtered.clear();
+            self.estimate = Estimate::default();
+            self.found.clear();
             return;
         };
-        self.plans = policy::plan_all(inv, &self.settings, &self.decisions);
+        self.plans = policy::plan_all(&inv, &self.settings, &self.decisions);
+        self.rt_plans = policy::plan_all_runtime(&inv, &self.settings, &self.decisions);
         let mut seen = std::collections::HashSet::new();
         self.unique = (0..inv.textures.len()).filter(|&i| seen.insert(inv.textures[i].key.clone())).collect();
+        self.estimate = derived::estimate(&inv, &self.unique, &self.plans, &self.rt_plans, &self.decisions, &self.settings);
         self.filter_dirty = true;
+        self.compare_dirty = true;
+        self.rescan();
     }
 
+    /// Look for the upscaled files again on a worker thread (the check touches the disk for every planned texture).
+    fn rescan(&mut self) {
+        if self.project.is_none() || self.inv.is_none() {
+            self.found.clear();
+        } else if self.found.invalidate() {
+            self.start_scan();
+        }
+    }
+
+    fn start_scan(&self) {
+        let (Some(p), Some(inv)) = (self.project.clone(), self.inv.clone()) else { return };
+        let (plans, unique, tx) = (self.plans.clone(), self.unique.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Found(derived::scan_upscaled(&p, &inv, &unique, &plans)));
+        });
+    }
+
+    /// The cached upscaled file of texture `i`.
     fn upscaled_path(&self, i: usize) -> Option<PathBuf> {
-        let (p, inv) = (self.project.as_ref()?, self.inv.as_ref()?);
-        let pl = &self.plans[i];
-        let (key, hash) = (pl.backend.key(), &inv.textures[i].key);
-        // A run that stepped down left its result at a lower scale.
-        pl.upscales().then(|| pipeline::find_upscaled(p, &key, hash, pl.scale).map_or_else(|| p.upscaled_path(&key, hash, pl.scale), |(path, _)| path))
+        self.found.get(i).map(|(p, _)| p.clone())
+    }
+
+    /// The scale the cached upscale of `i` really has, when it stepped down from the plan.
+    fn stepped_down(&self, i: usize) -> Option<u32> {
+        self.found.get(i).map(|f| f.1).filter(|&a| a != self.plans[i].scale)
     }
 
     fn apply_filter(&mut self) {
@@ -271,8 +341,8 @@ impl App {
                     StatusFilter::All => true,
                     StatusFilter::WillUpscale => pl.upscales(),
                     StatusFilter::Native => !pl.upscales(),
-                    StatusFilter::Upscaled => self.upscaled_path(i).is_some_and(|p| p.exists()),
-                    StatusFilter::NotUpscaled => pl.upscales() && !self.upscaled_path(i).is_some_and(|p| p.exists()),
+                    StatusFilter::Upscaled => self.found.get(i).is_some(),
+                    StatusFilter::NotUpscaled => pl.upscales() && self.found.get(i).is_none(),
                     StatusFilter::Pending => review == ReviewStatus::Pending,
                     StatusFilter::Approved => review == ReviewStatus::Approved,
                     StatusFilter::Rejected => review == ReviewStatus::Rejected,
@@ -384,10 +454,43 @@ impl App {
         });
     }
 
+    fn start_runtime_export(&mut self) {
+        let (Some(p), Some(inv)) = (self.project.clone(), self.inv.clone()) else { return };
+        let (s, d) = (self.settings.clone(), self.decisions.clone());
+        self.spawn("Exporting runtime pack", move |prog, tx| {
+            let r = runtime_pack::export_runtime(&p, &s, &inv, &d, prog)?;
+            let msg = format!("Runtime pack: {} entries in {} package(s), {} MiB", r.entries, r.packages.len(), r.bytes >> 20);
+            let _ = tx.send(Msg::RuntimeExported(r));
+            Ok(msg)
+        });
+    }
+
+    /// Install the packages of `kind` into the detected (or chosen) mods folder.
+    fn start_install(&mut self, kind: InstallKind) {
+        let (Some(p), Some(info)) = (self.project.clone(), self.env_info.clone()) else { return };
+        let root = info.mods_path;
+        self.install_confirm = false;
+        self.create_confirm = None;
+        self.install_warnings.clear();
+        self.spawn("Installing", move |_, tx| {
+            let done = cli::install(&p, &root, true, kind)?;
+            let _ = tx.send(Msg::Installed(done.ids.clone(), done.warnings.clone()));
+            Ok(format!("Installed {} package(s); start the game to use them. {}", done.ids.len(), done.warnings.join(" ")))
+        });
+    }
+
+    /// Something a job wrote may have changed what exists on disk.
+    fn files_changed(&mut self) {
+        self.filter_dirty = true;
+        self.compare_dirty = true;
+        self.env_dirty = true;
+        self.rescan();
+    }
+
     fn run_compare(&mut self, i: usize) {
         let (Some(p), Some(inv)) = (self.project.clone(), self.inv.clone()) else { return };
         let s = self.settings.clone();
-        let scale = self.plans[i].scale.max(2).min(s.scale.max(2));
+        let scale = self.compare_scale;
         let tasks: Vec<UpscaleTask> = self
             .compare_backends
             .iter()
@@ -408,12 +511,26 @@ impl App {
                     self.recompute();
                 }
                 Msg::Exported(r) => self.last_report = Some(r),
-                Msg::Installed(ids) => self.status = format!("Installed {} package(s): {}. Restart the game.", ids.len(), ids.join(", ")),
+                Msg::RuntimeExported(r) => self.runtime_report = Some(r),
+                Msg::Installed(ids, warnings) => {
+                    self.status = format!("Installed {} package(s): {}. Restart the game.", ids.len(), ids.join(", "));
+                    self.install_warnings = warnings;
+                }
+                Msg::Found(r) => {
+                    if self.found.finish(r) {
+                        self.start_scan();
+                    }
+                    self.filter_dirty = true;
+                    self.compare_dirty = true;
+                }
                 Msg::Done(s) => {
                     self.status = s;
-                    self.filter_dirty = true;
+                    self.files_changed();
                 }
-                Msg::Failed(e) => self.status = format!("Stopped: {e}"),
+                Msg::Failed(e) => {
+                    self.status = format!("Stopped: {e}");
+                    self.files_changed();
+                }
             }
         }
         let (n, lines) = self.progress.log_lines(self.log_seen);
@@ -450,6 +567,50 @@ fn checker(ui: &egui::Ui, rect: egui::Rect) {
     }
 }
 
+fn scale_text(v: u32) -> String {
+    if v <= 1 { "Native".into() } else { format!("×{v}") }
+}
+
+fn choice_text(c: ScaleChoice) -> String {
+    match c {
+        ScaleChoice::Global => "Global".into(),
+        ScaleChoice::Native => "Native".into(),
+        ScaleChoice::X(v) => format!("×{v}"),
+    }
+}
+
+fn texel_text(n: u64) -> String {
+    format!("{:.1} M", n as f64 / 1e6)
+}
+
+/// Per class and in total: replacements, texels, disk and texture memory of the runtime pack at the current policy.
+fn estimate_table(ui: &mut egui::Ui, id: &str, est: &Estimate) {
+    egui::Grid::new(id).num_columns(5).striped(true).spacing([20.0, 4.0]).show(ui, |ui| {
+        for h in ["Class", "Replaced", "Texels", "Disk", "Texture memory"] {
+            ui.label(RichText::new(h).strong());
+        }
+        ui.end_row();
+        for (c, e) in &est.classes {
+            ui.label(c.label());
+            ui.label(e.replaced.to_string());
+            ui.label(texel_text(e.texels));
+            ui.label(mib(e.disk));
+            ui.label(mib(e.vram));
+            ui.end_row();
+        }
+        let t = &est.total;
+        ui.label(RichText::new("Total").strong());
+        ui.label(t.replaced.to_string());
+        ui.label(texel_text(t.texels));
+        ui.label(mib(t.disk));
+        ui.label(mib(t.vram));
+        ui.end_row();
+    });
+    if let Some(w) = runtime_pack::vram_warning(est.total.vram) {
+        ui.label(RichText::new(format!("Warning: {w}")).color(Color32::from_rgb(230, 160, 80)));
+    }
+}
+
 fn mib(b: u64) -> String {
     if b >= 1 << 30 {
         format!("{:.2} GiB", b as f64 / (1u64 << 30) as f64)
@@ -458,27 +619,16 @@ fn mib(b: u64) -> String {
     }
 }
 
-fn dir_size(p: &std::path::Path) -> u64 {
-    let mut total = 0;
-    if let Ok(rd) = std::fs::read_dir(p) {
-        for e in rd.flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                total += dir_size(&path);
-            } else if let Ok(m) = e.metadata() {
-                total += m.len();
-            }
-        }
-    }
-    total
-}
-
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         self.pump(ctx);
         if self.filter_dirty {
             self.apply_filter();
+        }
+        if self.env_dirty && matches!(self.view, View::Export | View::Settings) {
+            self.env_info = Some(EnvInfo::detect(&self.settings, &Env::from_process()));
+            self.env_dirty = false;
         }
 
         egui::Panel::top("top").show(root, |ui| {
@@ -499,6 +649,9 @@ impl eframe::App for App {
                     if let Some(d) = rfd::FileDialog::new().set_title("Wind Waker HD disc folder (code/content/meta)").pick_folder() {
                         self.settings.disc_root = d;
                         self.save_settings();
+                        if self.rescan_needed() {
+                            self.status = "Disc folder changed: press Scan to read it (the earlier scan is of another folder).".into();
+                        }
                     }
                 }
                 ui.label(RichText::new(self.settings.disc_root.display().to_string()).weak());
@@ -558,6 +711,8 @@ impl eframe::App for App {
             ] {
                 if ui.selectable_label(self.view == v, name).clicked() {
                     self.view = v;
+                    // The folders may have changed outside the program (the game creates its mods folder on first start).
+                    self.env_dirty = true;
                 }
             }
         });
@@ -581,6 +736,24 @@ impl eframe::App for App {
 }
 
 impl App {
+    /// The Refresh estimates button and whether what is shown matches the settings.
+    fn estimate_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.inv.is_some(), egui::Button::new("Refresh estimates"))
+                .on_hover_text("Work out the plans and the estimates again with the current settings")
+                .clicked()
+            {
+                self.recompute();
+            }
+            if self.settings_stale {
+                ui.label(RichText::new("Settings changed: the plans and estimates are out of date. Press Refresh estimates.").color(Color32::from_rgb(230, 160, 80)));
+            } else {
+                ui.label(RichText::new("Plans and estimates match the current settings.").weak());
+            }
+        });
+    }
+
     fn dashboard(&mut self, ui: &mut egui::Ui) {
         let Some(inv) = self.inv.clone() else {
             ui.heading("Welcome");
@@ -589,66 +762,58 @@ impl App {
             ui.label("3. Press ▶ Process everything, or run the steps one by one and review textures in Assets.");
             return;
         };
-        let p = self.project.clone().unwrap();
-        let upscaled = self.unique.iter().filter(|&&i| self.upscaled_path(i).is_some_and(|x| x.exists())).count();
+        self.estimate_controls(ui);
+        ui.add_space(6.0);
+        let upscaled = self.unique.iter().filter(|&&i| self.found.get(i).is_some()).count();
         let planned = self.unique.iter().filter(|&&i| self.plans[i].upscales()).count();
-        let extracted = self.unique.iter().filter(|&&i| p.master_path(&inv.textures[i].key).exists()).count();
         let problems = self.unique.iter().filter(|&&i| !inv.textures[i].gate_ok || !inv.textures[i].decodable).count();
-        egui::Grid::new("dash").num_columns(2).striped(true).spacing([30.0, 6.0]).show(ui, |ui| {
-            for (k, v) in [
-                ("Disc folder", inv.root.clone()),
-                ("Resource files scanned", inv.files.len().to_string()),
-                ("Textures found (all copies)", inv.textures.len().to_string()),
-                ("Unique textures", self.unique.len().to_string()),
-                ("Extracted masters", extracted.to_string()),
-                ("Planned for upscaling", planned.to_string()),
-                ("Upscaled", format!("{upscaled} / {planned}")),
-                ("Unsupported or not rewritable", problems.to_string()),
-                ("Scan / archive errors", inv.errors.len().to_string()),
-                ("Project disk use (cache + masters + output)", mib(dir_size(&p.root))),
-            ] {
-                ui.label(k);
-                ui.label(RichText::new(v).strong());
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("dash").num_columns(2).striped(true).spacing([30.0, 6.0]).show(ui, |ui| {
+                for (k, v) in [
+                    ("Disc folder", inv.root.clone()),
+                    ("Resource files scanned", inv.files.len().to_string()),
+                    ("Textures found (all copies)", inv.textures.len().to_string()),
+                    ("Unique textures", self.unique.len().to_string()),
+                    ("Extracted masters", self.found.extracted.to_string()),
+                    ("Planned for upscaling", planned.to_string()),
+                    ("Upscaled", format!("{upscaled} / {planned}")),
+                    ("Unsupported or not rewritable", problems.to_string()),
+                    ("Scan / archive errors", inv.errors.len().to_string()),
+                    ("Project disk use (cache + masters + output)", mib(self.found.disk_bytes)),
+                ] {
+                    ui.label(k);
+                    ui.label(RichText::new(v).strong());
+                    ui.end_row();
+                }
+            });
+            ui.add_space(12.0);
+            ui.heading("By class (rebuilt archives)");
+            egui::Grid::new("classes").num_columns(6).striped(true).spacing([20.0, 4.0]).show(ui, |ui| {
+                for h in ["Class", "Unique", "Upscaled", "Backend", "Size now", "Size after"] {
+                    ui.label(RichText::new(h).strong());
+                }
                 ui.end_row();
-            }
-        });
-        ui.add_space(12.0);
-        ui.heading("By class");
-        let mut rows: std::collections::BTreeMap<Class, (usize, usize, u64, u64)> = Default::default();
-        for &i in &self.unique {
-            let t = &inv.textures[i];
-            let e = rows.entry(self.decisions.classification(t).class).or_default();
-            e.0 += 1;
-            if self.plans[i].upscales() {
-                e.1 += 1;
-            }
-            e.2 += policy::surface_bytes(t, 1);
-            e.3 += policy::surface_bytes(t, self.plans[i].scale);
-        }
-        egui::Grid::new("classes").num_columns(6).striped(true).spacing([20.0, 4.0]).show(ui, |ui| {
-            for h in ["Class", "Unique", "Upscaled", "Backend", "Size now", "Size after"] {
-                ui.label(RichText::new(h).strong());
-            }
-            ui.end_row();
-            let (mut a, mut b) = (0, 0);
-            for (c, (n, u, x, y)) in rows {
-                ui.label(c.label());
-                ui.label(n.to_string());
-                ui.label(u.to_string());
-                ui.label(self.settings.backend_for(c).label());
-                ui.label(mib(x));
-                ui.label(mib(y));
-                a += x;
-                b += y;
+                for (c, e) in &self.estimate.classes {
+                    ui.label(c.label());
+                    ui.label(e.unique.to_string());
+                    ui.label(e.upscaled.to_string());
+                    ui.label(self.settings.backend_for(*c).label());
+                    ui.label(mib(e.bytes_now));
+                    ui.label(mib(e.bytes_after));
+                    ui.end_row();
+                }
+                let t = &self.estimate.total;
+                ui.label(RichText::new("Total (unique textures)").strong());
+                ui.label(t.unique.to_string());
+                ui.label(t.upscaled.to_string());
+                ui.label("");
+                ui.label(mib(t.bytes_now));
+                ui.label(mib(t.bytes_after));
                 ui.end_row();
-            }
-            ui.label(RichText::new("Total (unique textures)").strong());
-            ui.label("");
-            ui.label("");
-            ui.label("");
-            ui.label(mib(a));
-            ui.label(mib(b));
-            ui.end_row();
+            });
+            ui.add_space(12.0);
+            ui.heading("Runtime pack at the current policy");
+            estimate_table(ui, "dash_rt", &self.estimate);
         });
     }
 
@@ -657,6 +822,7 @@ impl App {
             ui.label("Scan the disc first.");
             return;
         };
+        self.estimate_controls(ui);
         ui.horizontal_wrapped(|ui| {
             ui.label("Search");
             if ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(160.0)).changed() {
@@ -765,12 +931,13 @@ impl App {
                             self.selected = Some(i);
                         }
                         resp.on_hover_text(format!(
-                            "{}\n{}x{} {}\n{}",
+                            "{}\n{}x{} {}\n{}{}",
                             t.id.location.display(),
                             t.surface.width,
                             t.surface.height,
                             wwhd_tex::gx2::format_name(t.surface.format),
-                            self.plans[i].reason
+                            self.plans[i].reason,
+                            self.stepped_down(i).map(|a| format!(" (reached x{a})")).unwrap_or_default()
                         ));
                     }
                 });
@@ -788,6 +955,7 @@ impl App {
         let cl = self.decisions.classification(t);
         ui.heading(&t.id.name);
         ui.label(RichText::new(t.id.location.display()).weak());
+        let reached = self.stepped_down(i);
         let copies = inv.textures.iter().filter(|x| x.key == t.key).count();
         egui::Grid::new("meta").num_columns(2).spacing([16.0, 2.0]).show(ui, |ui| {
             let s = &t.surface;
@@ -800,8 +968,16 @@ impl App {
                 ("Original hash", t.data_hash[..16].to_string()),
                 ("Rewrite gate", if t.gate_ok { "passed".to_string() } else { format!("failed: {}", t.gate_detail) }),
                 ("Class", format!("{} ({:.0}% — {})", cl.class.label(), cl.confidence * 100.0, cl.reason)),
-                ("Plan", plan.reason.clone()),
-                ("Output", if plan.upscales() { format!("{}×{} via {}", s.width * plan.scale, s.height * plan.scale, plan.backend.label()) } else { "original kept".into() }),
+                ("Plan", format!("{}{}", plan.reason, reached.map(|a| format!(" → x{a} reached: the larger scale did not work for this texture")).unwrap_or_default())),
+                (
+                    "Output",
+                    if plan.upscales() {
+                        let a = reached.unwrap_or(plan.scale);
+                        format!("{}×{} via {}", s.width * a, s.height * a, plan.backend.label())
+                    } else {
+                        "original kept".into()
+                    },
+                ),
             ] {
                 ui.label(k);
                 ui.label(v);
@@ -811,9 +987,10 @@ impl App {
         if let Some(up) = self.upscaled_path(i) {
             if let Some(m) = pipeline::load_meta(&up) {
                 ui.label(format!(
-                    "Made with {} in {:.2} s{}{}",
+                    "Made with {} in {:.2} s{}{}{}",
                     m.used.label(),
                     m.seconds,
+                    if m.steps.is_empty() { String::new() } else { format!(" — {}", m.steps.join("; ")) },
                     if m.consistency_db > 0.0 { format!(", consistency {:.1} dB", m.consistency_db) } else { String::new() },
                     if m.note.is_empty() { String::new() } else { format!(" — {}", m.note) }
                 ));
@@ -863,9 +1040,16 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Scale:");
             let mut sc = review.scale.unwrap_or(0);
-            for (v, l) in [(0u32, "auto"), (1, "×1"), (2, "×2"), (4, "×4")] {
-                ui.selectable_value(&mut sc, v, l);
-            }
+            let label = |v: u32| match v {
+                0 => "auto (class / global)".to_string(),
+                1 => "Native".to_string(),
+                v => format!("×{v}"),
+            };
+            egui::ComboBox::from_id_salt("texscale").selected_text(label(sc)).show_ui(ui, |ui| {
+                for v in [0u32, 1].into_iter().chain(SCALES) {
+                    ui.selectable_value(&mut sc, v, label(v));
+                }
+            });
             if sc != review.scale.unwrap_or(0) {
                 review.scale = (sc != 0).then_some(sc);
                 self.decisions.reviews.insert(t.key.clone(), review.clone());
@@ -898,6 +1082,11 @@ impl App {
         });
         let master = p.master_path(&t.key);
         let up = self.upscaled_path(i);
+        let up_label = match self.found.get(i) {
+            Some((_, a)) => format!("Upscaled ×{a}"),
+            None if plan.upscales() => "Not upscaled yet".to_string(),
+            None => "No upscale planned".to_string(),
+        };
         let map = if self.compare_mode == CompareMode::Normals { [0, 1, 2, 5] } else { pipeline::display_map(t) };
         let images = self.images.as_mut().unwrap();
         let a = images.get_mapped(&master, map);
@@ -927,7 +1116,7 @@ impl App {
             CompareMode::SideBySide => {
                 ui.horizontal(|ui| {
                     show(ui, &a, None, "Original");
-                    show(ui, &b, None, if up.is_some() { "Upscaled" } else { "No upscale planned" });
+                    show(ui, &b, None, &up_label);
                 });
             }
             CompareMode::Slider => {
@@ -962,6 +1151,29 @@ impl App {
         });
     }
 
+    /// Look up the comparison results for texture `i` at the comparison scale (a few files; done when the selection,
+    /// scale, model choice or files change, not every frame).
+    fn refresh_compare(&mut self, i: usize) {
+        let (Some(p), Some(inv)) = (self.project.clone(), self.inv.clone()) else { return };
+        let (key, scale) = (inv.textures[i].key.clone(), self.compare_scale);
+        self.compare_found = self
+            .compare_backends
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(b, _)| {
+                let found = pipeline::find_upscaled(&p, &b.key(), &key, scale);
+                let extra = found
+                    .as_ref()
+                    .and_then(|(path, _)| pipeline::load_meta(path))
+                    .map(|m| format!(" ({:.1}s{})", m.seconds, if m.note.is_empty() { String::new() } else { format!(", {}", m.note) }))
+                    .unwrap_or_default();
+                (b.clone(), found, extra)
+            })
+            .collect();
+        self.compare_for = Some((i, scale));
+        self.compare_dirty = false;
+    }
+
     fn compare(&mut self, ui: &mut egui::Ui) {
         let (Some(inv), Some(p)) = (self.inv.clone(), self.project.clone()) else {
             ui.label("Scan the disc first.");
@@ -974,13 +1186,20 @@ impl App {
         let t = &inv.textures[i];
         ui.heading(format!("Compare models: {}", t.id.name));
         let tools = Tools { dir: self.settings.tools_dir.clone() };
+        let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             for (b, on) in self.compare_backends.iter_mut() {
                 let avail = tools.available(b);
-                ui.add_enabled(avail, egui::Checkbox::new(on, b.label())).on_disabled_hover_text("not installed in the tools folder");
+                changed |= ui.add_enabled(avail, egui::Checkbox::new(on, b.label())).on_disabled_hover_text("not installed in the tools folder").changed();
             }
         });
         ui.horizontal(|ui| {
+            ui.label("Scale");
+            egui::ComboBox::from_id_salt("cmpscale").selected_text(format!("×{}", self.compare_scale)).show_ui(ui, |ui| {
+                for v in SCALES {
+                    ui.selectable_value(&mut self.compare_scale, v, format!("×{v}"));
+                }
+            });
             if ui.add_enabled(!self.busy(), egui::Button::new("Run selected models")).clicked() {
                 self.run_compare(i);
             }
@@ -988,13 +1207,19 @@ impl App {
             ui.label("Click a result to use that model for this texture.");
         });
         ui.separator();
-        let scale = self.plans[i].scale.max(2).min(self.settings.scale.max(2));
+        let scale = self.compare_scale;
+        if changed || self.compare_dirty || self.compare_for != Some((i, scale)) {
+            self.refresh_compare(i);
+        }
         let cell = 300.0 * self.zoom;
-        let mut entries: Vec<(String, PathBuf, Option<BackendChoice>)> = vec![("Original".into(), p.master_path(&t.key), None)];
-        for (b, on) in &self.compare_backends {
-            if *on {
-                entries.push((b.label(), p.upscaled_path(&b.key(), &t.key, scale), Some(b.clone())));
-            }
+        // (label, image to show, model to choose on click)
+        let mut entries: Vec<(String, Option<PathBuf>, Option<BackendChoice>)> = vec![("Original".into(), Some(p.master_path(&t.key)), None)];
+        for (b, found, extra) in &self.compare_found {
+            let label = match found {
+                Some((_, a)) if *a != scale => format!("{} ×{a} (×{scale} did not work){extra}", b.label()),
+                _ => format!("{}{extra}", b.label()),
+            };
+            entries.push((label, found.as_ref().map(|f| f.0.clone()), Some(b.clone())));
         }
         let per_row = ((ui.available_width() / (cell + 10.0)).floor() as usize).max(1);
         let mut choose = None;
@@ -1003,12 +1228,11 @@ impl App {
                 ui.horizontal(|ui| {
                     for (label, path, b) in row {
                         ui.vertical(|ui| {
-                            let meta = pipeline::load_meta(path);
-                            let extra = meta.map(|m| format!(" ({:.1}s{})", m.seconds, if m.note.is_empty() { String::new() } else { format!(", {}", m.note) })).unwrap_or_default();
-                            ui.label(format!("{label}{extra}"));
+                            ui.label(label);
                             let (rect, resp) = ui.allocate_exact_size(Vec2::splat(cell), Sense::click());
                             checker(ui, rect);
-                            if let Some(tex) = self.images.as_mut().unwrap().get_mapped(path, pipeline::display_map(t)) {
+                            let tex = path.as_ref().and_then(|path| self.images.as_mut().unwrap().get_mapped(path, pipeline::display_map(t)));
+                            if let Some(tex) = tex {
                                 ui.painter().image(tex.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
                             } else if b.is_some() {
                                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "not run yet", egui::FontId::proportional(13.0), Color32::GRAY);
@@ -1034,7 +1258,83 @@ impl App {
 
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         let mut s = self.settings.clone();
+        let info = self.env_info.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.estimate_controls(ui);
+            ui.heading("Folders");
+            ui.horizontal(|ui| {
+                ui.label("Game disc folder");
+                let mut t = s.disc_root.display().to_string();
+                if ui.add(egui::TextEdit::singleline(&mut t).desired_width(440.0)).changed() {
+                    s.disc_root = PathBuf::from(t);
+                }
+                if ui.button("…").on_hover_text("Choose the folder that contains code/, content/ and meta/").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().set_title("Wind Waker HD disc folder (code/content/meta)").pick_folder() {
+                        s.disc_root = d;
+                    }
+                }
+            });
+            if s.disc_root.as_os_str().is_empty() {
+                ui.label(RichText::new("Not chosen yet.").weak());
+            } else if info.as_ref().is_some_and(|i| !i.disc_ok) {
+                ui.label(RichText::new("This folder has no content folder, so it does not look like a disc dump (code/, content/, meta/).").color(Color32::from_rgb(230, 160, 80)));
+            } else {
+                ui.label(RichText::new("Looks like a disc dump (it has a content folder).").weak());
+            }
+            if self.rescan_needed() {
+                ui.label(RichText::new("The textures shown come from a scan of another folder. Press Scan (top bar) to read this one; it is not started automatically.").color(Color32::from_rgb(230, 160, 80)));
+            }
+            ui.horizontal(|ui| {
+                ui.label("Mods folder");
+                let mut t = s.mods_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                let hint = info.as_ref().map(|i| i.mods_path.display().to_string()).unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut t).hint_text(hint).desired_width(440.0)).changed() {
+                    s.mods_root = (!t.trim().is_empty()).then(|| PathBuf::from(t.trim()));
+                }
+                if ui.button("…").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().set_title("The recomp's ModManager folder").pick_folder() {
+                        s.mods_root = Some(d);
+                    }
+                }
+                if s.mods_root.is_some() && ui.button("Use detection").clicked() {
+                    s.mods_root = None;
+                }
+            });
+            if let Some(i) = &info {
+                ui.label(
+                    RichText::new(format!(
+                        "In use: {} (found by: {}); {}{}. Leave the field empty to use this.",
+                        i.mods_path.display(),
+                        i.mods_rule.label(),
+                        if i.mods_exists { "the folder exists" } else { "the folder does not exist yet" },
+                        if i.has_profiles { ", profiles.json present" } else { "" }
+                    ))
+                    .weak(),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label("Game executable");
+                let mut t = s.game_exe.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+                let hint = info.as_ref().and_then(|i| i.game_exe.as_ref()).map(|p| p.display().to_string()).unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut t).hint_text(hint).desired_width(440.0)).changed() {
+                    s.game_exe = (!t.trim().is_empty()).then(|| PathBuf::from(t.trim()));
+                }
+                if ui.button("…").clicked() {
+                    if let Some(f) = rfd::FileDialog::new().set_title("wwhd.exe").pick_file() {
+                        s.game_exe = Some(f);
+                    }
+                }
+                if s.game_exe.is_some() && ui.button("Use detection").clicked() {
+                    s.game_exe = None;
+                }
+            });
+            ui.label(
+                RichText::new(match info.as_ref().and_then(|i| i.game_exe.as_ref()) {
+                    Some(p) => format!("In use: {}. Its folder decides portable mode (portable.txt) when looking for the mods folder.", p.display()),
+                    None => "No game executable known (none chosen, none in build/game beside the disc folder's checkout): portable mode is not checked.".into(),
+                })
+                .weak(),
+            );
             ui.heading("Scanning");
             ui.horizontal(|ui| {
                 ui.radio_value(&mut s.scope, ScanScope::ContentOnly, "Content folder only");
@@ -1054,15 +1354,32 @@ impl App {
             ui.heading("Resolution policy");
             ui.horizontal(|ui| {
                 ui.label("Scale");
-                for v in [2u32, 4] {
-                    ui.selectable_value(&mut s.scale, v, format!("×{v}"));
-                }
+                egui::ComboBox::from_id_salt("globalscale").selected_text(scale_text(s.scale)).show_ui(ui, |ui| {
+                    for v in std::iter::once(1).chain(SCALES) {
+                        ui.selectable_value(&mut s.scale, v, scale_text(v));
+                    }
+                });
+                ui.label("Max side");
+                egui::ComboBox::from_id_salt("maxside").selected_text(format!("{} px", s.max_dim)).show_ui(ui, |ui| {
+                    for v in [2048u32, 4096, 8192, 16384] {
+                        ui.selectable_value(&mut s.max_dim, v, format!("{v} px"));
+                    }
+                });
             });
-            ui.add(egui::Slider::new(&mut s.max_dim, 512..=8192).step_by(512.0).text("maximum output side (px)"));
+            ui.label(
+                RichText::new("A texture whose scale would pass the max side steps down (×32 → ×16 → … → ×2); only a texture that cannot even double stays native. A class below, or a texture in Assets, can set its own scale.")
+                    .weak(),
+            );
             ui.add(egui::Slider::new(&mut s.min_source_dim, 1..=128).text("keep native below (px)"));
+            ui.label("Runtime pack at the current policy:");
+            estimate_table(ui, "settings_rt", &self.estimate);
             ui.heading("Models per class");
             let tools = Tools { dir: s.tools_dir.clone() };
-            egui::Grid::new("backends").num_columns(2).striped(true).show(ui, |ui| {
+            egui::Grid::new("backends").num_columns(3).striped(true).show(ui, |ui| {
+                ui.label(RichText::new("Class").strong());
+                ui.label(RichText::new("Model").strong());
+                ui.label(RichText::new("Scale").strong());
+                ui.end_row();
                 for c in ALL_CLASSES {
                     ui.label(c.label());
                     let cur = s.backend_for(c);
@@ -1077,6 +1394,16 @@ impl App {
                     if chosen != cur {
                         s.backends.retain(|(x, _)| *x != c);
                         s.backends.push((c, chosen));
+                    }
+                    let cur_scale = s.scale_choice_for(c);
+                    let mut sc = cur_scale;
+                    egui::ComboBox::from_id_salt(format!("cs{c:?}")).width(110.0).selected_text(choice_text(cur_scale)).show_ui(ui, |ui| {
+                        for ch in [ScaleChoice::Global, ScaleChoice::Native].into_iter().chain(SCALES.map(ScaleChoice::X)) {
+                            ui.selectable_value(&mut sc, ch, choice_text(ch));
+                        }
+                    });
+                    if sc != cur_scale {
+                        derived::set_class_scale(&mut s.class_scales, c, sc);
                     }
                     ui.end_row();
                 }
@@ -1196,82 +1523,169 @@ impl App {
             ui.label("Scan the disc first.");
             return;
         };
-        ui.heading("Targets");
-        ui.label(RichText::new("✔ ZeldaWWHD recomp (desktop and PCVR): rebuilt archives as content packages").strong());
-        ui.label("Each texture keeps its original GX2 format (BC1/BC3/BC4/BC5/RGBA8): the game's GPU path has no BC7. Packages are split to stay within the mod loader's limits (128 MiB per file, 512 MiB and 4096 files per package).");
-        ui.label(RichText::new("✖ Quest 3 / Steam Frame (ASTC) and PCVR BC7: not loadable yet").color(Color32::from_rgb(220, 170, 90)));
-        ui.label("These need a runtime texture replacement path in the recomp (see docs/runtime-adapter.md). The lossless masters and upscaled PNGs in the project are the inputs for that later.");
-        ui.separator();
-        ui.heading("Budget");
-        let mut by_file: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
-        for (t, pl) in inv.textures.iter().zip(&self.plans) {
-            if pl.upscales() && self.settings.file_selected(&t.id.location.file) {
-                let e = by_file.entry(t.id.location.file.as_str()).or_default();
-                e.0 += policy::surface_bytes(t, 1);
-                e.1 += policy::surface_bytes(t, pl.scale);
-            }
-        }
-        let growth: u64 = by_file.values().map(|(a, b)| b - a).sum();
-        let resident: u64 = by_file.iter().filter(|(f, _)| f.contains("permanent")).map(|(_, (a, b))| b - a).sum();
-        ui.label(format!("{} archives will be rebuilt; texture data grows by {} in total.", by_file.len(), mib(growth)));
-        ui.label(format!("Always-loaded packs (permanent*.pack) grow by {} — this memory is used all the time in game.", mib(resident)));
-        if resident > 256 << 20 {
-            ui.label(RichText::new("Warning: the always-loaded packs grow a lot; if the game runs out of memory, lower the per-archive budget or the scale.").color(Color32::from_rgb(230, 160, 80)));
-        }
-        let worst = by_file.iter().map(|(f, (a, b))| (b - a, *f)).max();
-        if let Some((g, f)) = worst {
-            ui.label(format!("Largest growth: {f} (+{})", mib(g)));
-        }
-        ui.separator();
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!self.busy(), egui::Button::new("Validate and export packages")).clicked() {
-                self.start_pipeline(false, false, false, true);
-            }
-            if let Some(p) = &self.project {
-                if ui.button("Open packages folder").clicked() {
-                    let _ = open_folder(&p.packages_dir());
-                }
-            }
-        });
-        if let Some(r) = &self.last_report {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Two ways to deliver the upscales");
+            ui.label(RichText::new("Runtime pack: the recomp swaps textures at draw time").strong());
+            ui.label("BC7/BC4/BC5 DDS files keyed by the original texture's contents. No game-heap limit, so the policy's full scale is used. Needs the game's vr.texturePacks setting (on by default).");
+            ui.label(RichText::new("Rebuilt archives: content packages with the game's own archives rewritten").strong());
+            ui.label("Each texture keeps its original GX2 format (BC1/BC3/BC4/BC5/RGBA8). Packages are split to stay within the mod loader's limits (128 MiB per file, 512 MiB and 4096 files per package).");
+            ui.label(RichText::new("Use one or the other. Both replace the same textures in different ways; with both switched on one of them does nothing and its memory is wasted. Installing one kind leaves the other kind's packages alone and warns when both are on.").color(Color32::from_rgb(230, 160, 80)));
+            ui.separator();
+            self.estimate_controls(ui);
+            ui.separator();
+
+            ui.heading("Runtime pack");
+            let t = &self.estimate.total;
             ui.label(format!(
-                "Last export: {} textures in {} archives; {} → {} on disc; +{} texture data.",
-                r.textures_replaced,
-                r.files_rebuilt,
-                mib(r.bytes_original),
-                mib(r.bytes_rebuilt),
-                mib(r.guest_growth_bytes)
+                "At the current policy: {} textures get a replacement ({} texels), about {} on disk and {} of texture memory if all were resident.",
+                t.replaced,
+                texel_text(t.texels),
+                mib(t.disk),
+                mib(t.vram)
             ));
-            for (id, size, n) in &r.packages {
-                ui.label(format!("  {id}: {n} files, {}", mib(*size)));
+            if let Some(w) = runtime_pack::vram_warning(t.vram) {
+                ui.label(RichText::new(format!("Warning: {w}. The export still runs.")).color(Color32::from_rgb(230, 160, 80)));
             }
-            if !r.file_errors.is_empty() {
-                ui.label(RichText::new(format!("{} textures/files were kept original (see Diagnostics)", r.file_errors.len())).color(Color32::from_rgb(230, 160, 80)));
-            }
-        }
-        ui.separator();
-        ui.heading("Install into the game");
-        ui.horizontal(|ui| {
-            ui.label("ModManager folder");
-            ui.text_edit_singleline(&mut self.mods_root);
-            if ui.button("…").clicked() {
-                if let Some(d) = rfd::FileDialog::new().pick_folder() {
-                    self.mods_root = d.display().to_string();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.busy(), egui::Button::new("Export runtime pack")).clicked() {
+                    self.start_runtime_export();
+                }
+                if let Some(p) = &self.project {
+                    if ui.button("Open runtime folder").clicked() {
+                        let _ = open_folder(&p.runtime_dir());
+                    }
+                }
+            });
+            if let Some(r) = &self.runtime_report {
+                ui.label(format!(
+                    "Last runtime export: {} entries in {} package(s), {} on disc, ~{} texture memory; {} native by the policy, {} shared a key, {} skipped, {} failed.",
+                    r.entries,
+                    r.packages.len(),
+                    mib(r.bytes),
+                    mib(r.vram_estimate_bytes),
+                    r.native,
+                    r.shared,
+                    r.skipped.len(),
+                    r.errors.len()
+                ));
+                for (id, size, n) in &r.packages {
+                    ui.label(format!("  {id}: {n} entries, {}", mib(*size)));
+                }
+                let mut by_reason: std::collections::BTreeMap<&str, usize> = Default::default();
+                for sk in &r.skipped {
+                    *by_reason.entry(sk.reason.as_str()).or_default() += 1;
+                }
+                for (reason, n) in by_reason {
+                    ui.label(RichText::new(format!("  {n} skipped: {reason}")).weak());
+                }
+                for w in &r.warnings {
+                    ui.label(RichText::new(w).color(Color32::from_rgb(230, 160, 80)));
+                }
+                for e in r.errors.iter().take(5) {
+                    ui.label(RichText::new(e).color(Color32::from_rgb(230, 160, 80)));
                 }
             }
-        });
-        ui.checkbox(&mut self.install_confirm, "The game is closed; replace earlier Texture Studio packages there and switch the new ones on");
-        if ui.add_enabled(self.install_confirm && !self.busy() && self.project.is_some(), egui::Button::new("Install packages")).clicked() {
-            let p = self.project.clone().unwrap();
-            let root = PathBuf::from(&self.mods_root);
-            self.install_confirm = false;
-            self.spawn("Installing", move |_, tx| {
-                let done = crate::cli::install(&p, &root, true, crate::cli::InstallKind::Archives)?;
-                let _ = tx.send(Msg::Installed(done.ids.clone()));
-                Ok(format!("Installed {} package(s); start the game to use them. {}", done.ids.len(), done.warnings.join(" ")))
+            ui.separator();
+
+            ui.heading("Rebuilt archives");
+            let mut by_file: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+            for (t, pl) in inv.textures.iter().zip(&self.plans) {
+                if pl.upscales() && self.settings.file_selected(&t.id.location.file) {
+                    let e = by_file.entry(t.id.location.file.as_str()).or_default();
+                    e.0 += policy::surface_bytes(t, 1);
+                    e.1 += policy::surface_bytes(t, pl.scale);
+                }
+            }
+            let growth: u64 = by_file.values().map(|(a, b)| b - a).sum();
+            let resident: u64 = by_file.iter().filter(|(f, _)| f.contains("permanent")).map(|(_, (a, b))| b - a).sum();
+            ui.label(format!("{} archives will be rebuilt; texture data grows by {} in total.", by_file.len(), mib(growth)));
+            ui.label(format!("Always-loaded packs (permanent*.pack) grow by {} — this memory is used all the time in game.", mib(resident)));
+            if resident > 256 << 20 {
+                ui.label(RichText::new("Warning: the always-loaded packs grow a lot; if the game runs out of memory, lower the per-archive budget or the scale.").color(Color32::from_rgb(230, 160, 80)));
+            }
+            let worst = by_file.iter().map(|(f, (a, b))| (b - a, *f)).max();
+            if let Some((g, f)) = worst {
+                ui.label(format!("Largest growth: {f} (+{})", mib(g)));
+            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!self.busy(), egui::Button::new("Export rebuilt archives")).clicked() {
+                    self.start_pipeline(false, false, false, true);
+                }
+                if let Some(p) = &self.project {
+                    if ui.button("Open packages folder").clicked() {
+                        let _ = open_folder(&p.packages_dir());
+                    }
+                }
             });
-        }
-        ui.label(RichText::new("The game's Mods tab lists the packages as content mods; switching them off restores the original textures.").weak());
+            if let Some(r) = &self.last_report {
+                ui.label(format!(
+                    "Last export: {} textures in {} archives; {} → {} on disc; +{} texture data.",
+                    r.textures_replaced,
+                    r.files_rebuilt,
+                    mib(r.bytes_original),
+                    mib(r.bytes_rebuilt),
+                    mib(r.guest_growth_bytes)
+                ));
+                for (id, size, n) in &r.packages {
+                    ui.label(format!("  {id}: {n} files, {}", mib(*size)));
+                }
+                if !r.file_errors.is_empty() {
+                    ui.label(RichText::new(format!("{} textures/files were kept original (see Diagnostics)", r.file_errors.len())).color(Color32::from_rgb(230, 160, 80)));
+                }
+            }
+            ui.separator();
+
+            ui.heading("Install into the game");
+            match self.env_info.clone() {
+                Some(i) => {
+                    ui.label(format!("Mods folder: {}", i.mods_path.display()));
+                    ui.label(format!(
+                        "Found by: {}; {}{}.",
+                        i.mods_rule.label(),
+                        if i.mods_exists { "the folder exists" } else { "the folder does not exist yet" },
+                        if i.has_profiles { ", profiles.json present" } else { ", no profiles.json" }
+                    ));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Change the folder or the game executable in Settings.").weak());
+                        if ui.small_button("Open Settings").clicked() {
+                            self.view = View::Settings;
+                        }
+                    });
+                }
+                None => {
+                    ui.label("Looking for the mods folder…");
+                }
+            }
+            ui.checkbox(&mut self.install_confirm, "The game is closed; replace earlier Texture Studio packages of that kind there and switch the new ones on");
+            let can = self.install_confirm && !self.busy() && self.project.is_some() && self.env_info.is_some();
+            let exists = self.env_info.as_ref().is_some_and(|i| i.mods_exists);
+            ui.horizontal(|ui| {
+                for (kind, label) in [(InstallKind::Archives, "Install rebuilt archives"), (InstallKind::Runtime, "Install runtime pack")] {
+                    if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                        if exists {
+                            self.start_install(kind);
+                        } else {
+                            self.create_confirm = Some(kind);
+                        }
+                    }
+                }
+            });
+            if let (Some(kind), Some(i)) = (self.create_confirm, self.env_info.clone()) {
+                ui.label(RichText::new(format!("{} does not exist yet (the game creates it on its first start). Create it and install?", i.mods_path.display())).color(Color32::from_rgb(230, 160, 80)));
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(can, egui::Button::new("Create the folder and install")).clicked() {
+                        self.start_install(kind);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.create_confirm = None;
+                    }
+                });
+            }
+            for w in &self.install_warnings {
+                ui.label(RichText::new(format!("Warning: {w}")).color(Color32::from_rgb(230, 160, 80)));
+            }
+            ui.label(RichText::new("The game's Mods tab lists the packages; switching them off restores the original textures.").weak());
+        });
     }
 
     fn diagnostics(&mut self, ui: &mut egui::Ui) {

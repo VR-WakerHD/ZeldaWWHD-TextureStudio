@@ -365,9 +365,7 @@ impl InstallKind {
 /// (`mods_dir::detect`, with the game folder from Settings or `build/game` beside the disc dump). It must exist: the
 /// CLI never creates it and never guesses another place.
 pub fn resolve_mods_root(arg: Option<PathBuf>, s: &Settings, env: &Env) -> Result<(PathBuf, ModsRule)> {
-    let explicit = arg.or_else(|| s.mods_root.clone());
-    let game = s.game_exe.clone().or_else(|| mods_dir::game_exe_near_disc(&s.disc_root));
-    let (root, rule) = mods_dir::detect(explicit.as_deref(), game.as_deref(), env);
+    let (root, rule) = detect_mods_root(arg, s, env);
     if !root.is_dir() {
         return Err(wwhd_tex::Error::Format(format!(
             "mods folder {} ({}) does not exist; start the game once, or pass --mods-root",
@@ -376,6 +374,17 @@ pub fn resolve_mods_root(arg: Option<PathBuf>, s: &Settings, env: &Env) -> Resul
         )));
     }
     Ok((root, rule))
+}
+
+/// The game executable: the Settings one, else `build/game` beside the disc dump's checkout.
+pub fn game_exe(s: &Settings) -> Option<PathBuf> {
+    s.game_exe.clone().or_else(|| mods_dir::game_exe_near_disc(&s.disc_root))
+}
+
+/// Where the recomp keeps its mods, whether or not the folder exists yet (`resolve_mods_root` without the check).
+pub fn detect_mods_root(arg: Option<PathBuf>, s: &Settings, env: &Env) -> (PathBuf, ModsRule) {
+    let explicit = arg.or_else(|| s.mods_root.clone());
+    mods_dir::detect(explicit.as_deref(), game_exe(s).as_deref(), env)
 }
 
 /// What `install` did.

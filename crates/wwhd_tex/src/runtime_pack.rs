@@ -55,6 +55,20 @@ impl PackFormat {
         }
     }
 
+    /// Bytes of the level data of a `width` x `height` image with `levels` levels in this format (no DDS header):
+    /// what `write_dds` appends after `DDS_HEADER_BYTES`.
+    pub fn data_bytes(&self, width: u32, height: u32, levels: u32) -> u64 {
+        (0..levels.max(1))
+            .map(|l| {
+                let (w, h) = ((width >> l).max(1) as u64, (height >> l).max(1) as u64);
+                match self.block_bytes() {
+                    Some(b) => w.div_ceil(4) * h.div_ceil(4) * b as u64,
+                    None => w * h * 4,
+                }
+            })
+            .sum()
+    }
+
     fn block_bytes(&self) -> Option<usize> {
         match self {
             PackFormat::Bc4 { .. } => Some(8),
@@ -190,7 +204,7 @@ pub const PACKAGE_MAX_BYTES: u64 = 4 << 30;
 pub const VRAM_WARN_BYTES: u64 = 8 << 30;
 
 /// Bytes before the level data of a DDS written by `write_dds`.
-const DDS_HEADER_BYTES: u64 = 148;
+pub const DDS_HEADER_BYTES: u64 = 148;
 
 /// Whether `id` names a package of the runtime export.
 pub fn is_runtime_id(id: &str) -> bool {
@@ -511,6 +525,15 @@ mod tests {
     use crate::classify::Class;
 
     // XXH3-64 (seed 0) of the empty input, from the xxHash reference.
+    #[test]
+    fn data_bytes_matches_what_write_dds_writes() {
+        let levels: Vec<Vec<u8>> = [(8u32, 8u32), (4, 4), (2, 2)].iter().map(|&(w, h)| vec![128u8; (w * h * 4) as usize]).collect();
+        for fmt in [PackFormat::Bc7 { srgb: true }, PackFormat::Bc4 { snorm: false }, PackFormat::Bc5 { snorm: false }, PackFormat::Rgba8 { srgb: false }] {
+            let dds = write_dds(8, 8, fmt, &levels).unwrap();
+            assert_eq!(dds.len() as u64, DDS_HEADER_BYTES + fmt.data_bytes(8, 8, 3), "{fmt:?}");
+        }
+    }
+
     #[test]
     fn empty_hash_is_the_reference_value() {
         assert_eq!(key_hash(&[]), 0x2D06800538D394C2);

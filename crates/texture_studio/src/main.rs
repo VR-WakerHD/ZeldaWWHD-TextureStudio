@@ -2,6 +2,7 @@
 
 mod app;
 mod cli;
+mod derived;
 mod images;
 
 fn main() {
