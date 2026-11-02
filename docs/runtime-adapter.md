@@ -1,42 +1,26 @@
-# Runtime texture replacement — design note for the recomp (not implemented)
+# Runtime texture replacement — implemented (see the spec)
 
-> Superseded by the full design in `docs/superpowers/specs/2026-11-02-runtime-texture-adapter-design.md`
-> (key = XXH3-64 of level 0 rather than blake3; replacement bound per draw, not in place).
+Status: implemented in both repos on the `texture-packs` branches, covered by unit and smoke tests. **Not yet
+verified in the game or in the headset.**
 
-The current integration rebuilds game archives. That is safe and needs no game change, but it is limited:
+The design, formats and rules are in `docs/superpowers/specs/2026-11-02-runtime-texture-adapter-design.md`; that
+document is the source of truth. Usage is in `docs/user-guide.md`; the recomp side is in its `docs/mod-manager.md`
+(kind `textures`) and `docs/VR_SETTINGS.md` (`vr.texturePacks`, `vr.texturePackBudgetMB`).
 
-- textures must stay in their GX2 format (no BC7 on PCVR, no ASTC on Quest 3 / Steam Frame);
-- upscaled data lives in the game's guest memory and archive heaps;
-- the packages are large because whole archives are replaced.
+## What changed against the old outline
 
-A runtime adapter in ZeldaWWHD-VR would remove these limits.
+| Old outline | Implemented |
+|---|---|
+| Key = blake3 `data_hash` of the tiled level-0 bytes | Key = GX2 format, width, height and XXH3-64 of the level-0 guest bytes (`runtime_pack::key_hash`) |
+| Create the host image from the pack file instead of the guest data, in `surfaces.cpp` | The guest image is kept; the replacement is a separate image bound per draw (`replacement_for`), so copies, render targets and invalidation never see it |
+| Hash cached per guest allocation | Hashed once per upload of a texture whose bytes may have changed; level 0's hash is kept on the surface |
+| One output per platform: BC7 on PCVR, ASTC on Quest | BC only: BC1/2/3 → BC7, BC4 → BC4, BC5 → BC5, RGBA8 → BC7 (RGBA8 for UI and lettering); no ASTC |
+| Scale by class only | ×2, ×4, ×8, ×16, ×32 globally, per class or per texture; a scale that cannot be reached steps down one at a time, never skipping |
+| Not said | New mod-manager package kind `textures` (`textures_dir`), switched on after a restart; setting `vr.texturePacks`; VRAM budget `vr.texturePackBudgetMB`; images created at most 16 MiB / about 1 ms per frame; any mismatch or bad entry keeps the original |
 
-## Where it would hook
+## What is still open
 
-The recomp's renderers create host images from GX2 surfaces in `runtime/src/gfx/vulkan/surfaces.cpp`
-(and the Metal equivalent), after detiling with LatteAddrLib. At that point the guest texture's base address,
-format, dimensions, tile mode and data are known. The adapter would:
-
-1. hash the guest texture data (first level, tiled bytes) — the same blake3 `data_hash` this app records in
-   `manifests/replacement_manifest.json` (`original_hash`), plus format and dimensions as a guard;
-2. look the hash up in a table loaded from an installed replacement pack;
-3. if found, create the host image from the pack's file (DDS BC7/BC5 on desktop, KTX2 ASTC on Android)
-   instead of the guest data, keeping the guest texture's sampler and view semantics (component selector);
-4. fall back to the guest data on any mismatch.
-
-Hashing must be cached per guest allocation so it costs nothing per frame.
-
-## What this app already provides
-
-- `original_hash`, format, dimensions and texture name per replacement in `replacement_manifest.json`;
-- lossless upscaled PNGs per texture in `cache/upscaled/...`;
-- class information to choose BC7 vs BC5 vs BC4 and ASTC block sizes.
-
-Adding a DDS/KTX2 writer for those outputs is small once the game side exists.
-
-## Platform notes (unverified until the adapter exists)
-
-- PCVR (Vulkan on desktop GPUs): BC7 for colour, BC5 for normals, BC4 for masks.
-- Quest 3 (Adreno 740, Vulkan 1.3): ASTC LDR is supported in hardware; BC formats are not. ASTC 4×4 or 6×6
-  for colour.
-- Steam Frame: hardware and driver format support must be checked on the device before choosing formats.
+- A check in the game and in the headset (picture, frame rate, VRAM, the loading pace of the first frames).
+- ASTC output for Quest 3 and Steam Frame.
+- Textures the runtime pack cannot replace (cube maps, textures that are fetched or sampled by LOD in a shader, with
+  hand-made mips) stay original by design.

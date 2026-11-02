@@ -12,6 +12,7 @@ Data: USA Wind Waker HD dump, 1007 content files.
 | Export (cold) | 12 347 textures, 740 archives, 14 packages | 15 min (4 threads, no encode cache) | BC encode at ISPC "slow", mip chains, tiling, Yaz0, full validation |
 | Export (12 threads) | 12 358 textures, 740 archives | 4.5 min | |
 | Re-export with the memory-safe defaults (cached encodes) | 5 531 textures, 670 archives, 5 packages | 78 s | 0 errors |
+| Runtime pack export (`export-runtime`), full policy | 4 171 entries in 4 packages, 12.4 GiB estimated texture memory, ~12.7 GB on disc | ~21 min | 0 errors; at that time 1 236 textures still needed upscaling under the runtime plan. Measured 2026-11-02 |
 
 Export uses half the logical CPUs (max 12) and caches encoded surfaces, so shared textures are encoded once
 and a re-export after review changes only re-encodes what changed.

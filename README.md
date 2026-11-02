@@ -3,8 +3,9 @@
 A lightweight native desktop app (Rust + egui) that takes your own extracted **The Legend of Zelda: The Wind
 Waker HD** (Wii U) disc dump, extracts every texture, classifies it, upscales it with conventional or AI
 models (Real-ESRGAN, waifu2x, Real-CUGAN, RealSR), re-encodes it in the texture's original GX2 format with a
-proper mip chain, rebuilds the game archives and exports them as **content packages for the ZeldaWWHD recomp's
-mod manager**. The disc dump is never modified.
+proper mip chain, and exports the result for the ZeldaWWHD recomp's mod manager in one of two ways: **runtime texture
+packs** (BC7/BC5/BC4 DDS files the recomp binds at draw time, ×2 to ×32) or **rebuilt-archive content packages**.
+The disc dump is never modified.
 
 No game data is part of this repository, and none is written into it.
 
@@ -19,10 +20,12 @@ No game data is part of this repository, and none is written into it.
 | Normal maps, masks, ramps, alpha | Vector-aware normal resize + renormalise; masks conventional; ramps native; alpha resized separately |
 | Mip generation | sRGB-linear box filter, alpha-coverage preserving, normal renormalising |
 | Rebuild + validation | FTEX/BFLIM rewrite, SARC/Yaz0 rebuild, reopen + compare, PSNR check of every encoded texture |
-| Game integration | Content packages for the recomp's mod manager. **Verified in game** with the memory-safe defaults: boots, title demo, Dragon Roost gameplay. The game's fixed-size heaps limit growth to ~2× per archive and rule out some archives (see `docs/design.md`) |
+| Game integration: rebuilt archives | Content packages for the recomp's mod manager. **Verified in game** with the memory-safe defaults: boots, title demo, Dragon Roost gameplay. The game's fixed-size heaps limit growth to ~2× per archive and rule out some archives (see `docs/design.md`) |
+| Game integration: runtime pack | Studio side done: resolution policy (×2–×32, global / per class / per texture, steps down, never skips), `export-runtime`, `install --kind runtime`, mods-folder auto-detection. Recomp side implemented (`kind: textures`, `vr.texturePacks`) with unit and smoke tests. **Not yet verified in the game or the headset.** Use it or the archive packages, not both |
 | Cube maps (8 textures), 3 textures with non-standard mip offsets, 1 BC5 SNORM normal map below the quality bar | Listed in Diagnostics; originals kept |
-| Full 4K for every texture | Not possible by rebuilding archives (game heap sizes); needs the runtime adapter (`docs/runtime-adapter.md`) or larger game heaps in the recomp |
-| PCVR BC7 / Quest 3 & Steam Frame ASTC packages | Not loadable by the game without a runtime adapter — see `docs/runtime-adapter.md` |
+| Full 4K for every texture | Not possible by rebuilding archives (game heap sizes). The runtime pack has no such limit: a full export of the author's project is 4171 entries, 12.4 GiB estimated texture memory (see `docs/performance.md`); working in game is untested |
+| PCVR BC7 packages | Exported by the runtime pack (BC1/2/3 → BC7, BC4, BC5, RGBA8 → BC7 or RGBA8 for UI and lettering); loading in game untested |
+| Quest 3 & Steam Frame ASTC packages | Not exported; the runtime adapter loads BC formats only (see `docs/runtime-adapter.md`) |
 
 ## Build
 
@@ -62,8 +65,9 @@ Without them, every class falls back to Lanczos-3 (logged). Custom ESRGAN-family
 3. Press **▶ Process everything**: scan → extract → upscale → validate → export. Interrupted runs resume.
 4. Review in **Assets** (approve/reject, change class, scale or model, compare original vs result) and
    **Compare models** (run several models on one texture, click the best).
-5. **Export / install**: installs the packages into the recomp's `ModManager` folder and switches them on.
-   Switching them off in the game's Mods tab restores the original textures.
+5. **Export / install**: pick **Export runtime pack** or **Export rebuilt archives**, then install that kind into the
+   recomp's `ModManager` folder (found the way the recomp finds it; changeable in Settings) and switch it on. Use one
+   kind or the other, not both. Switching the packages off in the game's Mods tab restores the original textures.
 
 See `docs/user-guide.md` for details and the headless commands (`texture_studio --headless …`).
 
@@ -72,7 +76,7 @@ See `docs/user-guide.md` for details and the headless commands (`texture_studio 
 - `docs/design.md` — feasibility study, integration decision, pipeline design
 - `docs/formats.md` — supported resource formats, verification results
 - `docs/dependencies.md` — every dependency, its licence and redistribution notes
-- `docs/runtime-adapter.md` — what the recomp would need for BC7/ASTC runtime replacement
+- `docs/runtime-adapter.md` — the runtime adapter: what is implemented and where the design lives
 - `docs/user-guide.md` — GUI and command-line usage
 - `docs/performance.md` — measured timings and memory
 

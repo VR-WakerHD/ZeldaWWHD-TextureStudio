@@ -1,6 +1,6 @@
 # ZeldaWWHD Texture Studio — feasibility and design
 
-Date: 2026-11-02. Status: implemented 2026-11-02; integration verified in game with the memory-safe defaults (see below).
+Date: 2026-11-02. Status: implemented 2026-11-02; integration A (rebuilt archives) verified in game with the memory-safe defaults (see below). Integration B (runtime pack) was implemented in both repos later the same day and is not yet verified in the game or the headset.
 
 ## Decisions taken with the user
 
@@ -8,7 +8,7 @@ Date: 2026-11-02. Status: implemented 2026-11-02; integration verified in game w
 |---|---|
 | GUI stack | Rust + egui/eframe. Builds on Windows (this RTX 5080 PC) and Arch Linux from one codebase. GTK4 was rejected because the development PC is Windows 11 (only a Fedora WSL distro is present). |
 | Downloads | Official sources only: rustup, crates.io, upstream GitHub releases for upscaler binaries/models. Each recorded in `docs/dependencies.md`. |
-| Game integration | Rebuilt archives delivered as recomp **content packages** first. No change to ZeldaWWHD-VR. A runtime replacement adapter is documented as a future option only. |
+| Game integration | Rebuilt archives delivered as recomp **content packages** first. No change to ZeldaWWHD-VR. A runtime replacement adapter followed (B below) as a second way to deliver; the user uses one or the other. |
 | Game testing | Short flat (desktop) launches allowed on 2026-11-02 to verify loading. No VR performance tests. |
 | Upscalers | Implement as many official upscalers as practical so quality can be compared on real assets. |
 
@@ -43,8 +43,12 @@ Checked against the user's dump at `ZeldaWindWakerRecomp/game_disc` and the reco
 | Updating | Re-export affected archives | Swap single files |
 | Status | Implementable now | Separate coordinated project |
 
-**Chosen: A**, because it needs no game change and uses the existing, tested mod loader. B is documented in
-`docs/runtime-adapter.md` for later (BC7 on PCVR, ASTC for Quest 3/Steam Frame).
+**Chosen first: A**, because it needs no game change and uses the existing, tested mod loader. B was built
+afterwards for what A cannot do (full-scale textures, BC7 on PCVR): a new mod-manager package kind `textures` in
+the recomp, with the design in `docs/superpowers/specs/2026-11-02-runtime-texture-adapter-design.md` and a status
+note in `docs/runtime-adapter.md`. B has no ASTC output yet. B is implemented and unit/smoke-tested; **it is not
+yet verified in the game or the headset**. A and B replace the same textures in different ways, so only one of
+them should be switched on (the install step warns when both are).
 
 Consequences of A:
 - Output formats keep each texture's **original GX2 format** (BC1 stays BC1 etc.). The "PCVR BC7" and "Quest
@@ -61,8 +65,8 @@ Consequences of A:
     above plus all `Common/Pack/` are never rebuilt. With this, 5 531 textures in 670 archives were replaced;
     the game booted, ran the title demo for 4.5 minutes, loaded Quest Log 1 on Dragon Roost Island and stayed
     stable while walking and talking to the King of Red Lions.
-  - Full 4K everywhere therefore needs either the runtime adapter (approach B) or a recomp change that enlarges
-    the game's heaps.
+  - Full 4K everywhere therefore needs either the runtime adapter (approach B, no guest-heap limit) or a recomp
+    change that enlarges the game's heaps.
 - Packages are split into several content packages of ≤ 512 MiB / ≤ 4096 files, with no overlapping paths.
 
 ## Rebuild method (A) — safety rules
@@ -126,6 +130,5 @@ crates/texture_studio egui application + `--headless` CLI for scripted runs and 
 
 ## Out of scope for this iteration
 
-- Runtime texture adapter in ZeldaWWHD-VR (design note only).
-- BC7/ASTC game-loadable packages (need the adapter).
+- ASTC packages for Quest 3 / Steam Frame (the runtime adapter loads BC formats only).
 - AI-based classification (metadata/name/statistics rules first; listed as an option).
