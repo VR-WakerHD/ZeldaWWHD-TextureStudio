@@ -1665,8 +1665,12 @@ impl App {
             ui.checkbox(&mut self.install_confirm, "The game is closed; replace earlier Texture Studio packages of that kind there and switch the new ones on");
             let can = self.install_confirm && !self.busy() && self.project.is_some() && self.env_info.is_some();
             let exists = self.env_info.as_ref().is_some_and(|i| i.mods_exists);
-            ui.horizontal(|ui| {
-                for (kind, label) in [(InstallKind::Archives, "Install rebuilt archives"), (InstallKind::Runtime, "Install runtime pack")] {
+            // one row per kind, with what it trades off
+            for (kind, label, note) in [
+                (InstallKind::Archives, "Install rebuilt archives", "BC1 textures, faster loading, better performance"),
+                (InstallKind::Runtime, "Install runtime pack", "BC7 textures, sharper images, higher performance cost"),
+            ] {
+                ui.horizontal(|ui| {
                     if ui.add_enabled(can, egui::Button::new(label)).clicked() {
                         if exists {
                             self.start_install(kind);
@@ -1674,8 +1678,9 @@ impl App {
                             self.create_confirm = Some(kind);
                         }
                     }
-                }
-            });
+                    ui.label(RichText::new(note).weak());
+                });
+            }
             if let (Some(kind), Some(i)) = (self.create_confirm, self.env_info.clone()) {
                 ui.label(RichText::new(format!("{} does not exist yet (the game creates it on its first start). Create it and install?", i.mods_path.display())).color(Color32::from_rgb(230, 160, 80)));
                 ui.horizontal(|ui| {
