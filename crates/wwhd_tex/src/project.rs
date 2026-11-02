@@ -79,6 +79,10 @@ pub struct Settings {
     /// Archives (path fragments) that are never rebuilt: verified in game to
     /// be loaded into fixed-size heaps that cannot take larger textures.
     pub exclude_files: Vec<String>,
+    /// A mod manager folder chosen by hand; it overrides the recomp-order detection (`mods_dir::detect`).
+    pub mods_root: Option<PathBuf>,
+    /// The game's executable (`wwhd.exe`); its folder decides portable mode when looking for the mod manager folder.
+    pub game_exe: Option<PathBuf>,
 }
 
 /// Scale factors a texture or class can be set to (besides native).
@@ -144,6 +148,8 @@ impl Default for Settings {
             debug_tint: false,
             max_growth_factor: 2.0,
             exclude_files: default_excluded(),
+            mods_root: None,
+            game_exe: None,
         }
     }
 }

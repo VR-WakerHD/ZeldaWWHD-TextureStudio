@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use wwhd_tex::inventory::{self, Inventory};
+use wwhd_tex::mods_dir::{self, Env, ModsRule};
 use wwhd_tex::jobs::Progress;
 use wwhd_tex::pipeline;
 use wwhd_tex::policy::{self, Decisions};
@@ -23,8 +24,9 @@ Without arguments the GUI starts. Commands:
   export-runtime --project DIR [--only TEXT,TEXT] [--debug-tint]   runtime texture packs (index.json + DDS)
   run     --project DIR [--disc DIR] [--only TEXT,TEXT]   scan (if needed), extract, upscale, export
   compare  --project DIR --names TEXT,TEXT [--backends all|KEY,KEY] [--crop N]
-  install  --project DIR --mods-root DIR [--kind archives|runtime] [--no-enable]
-                                                            copy packages into a ModManager folder
+  install  --project DIR [--mods-root DIR] [--kind archives|runtime] [--no-enable]
+                                                            copy packages into the recomp's ModManager folder
+                                                            (found like the recomp does; --mods-root or Settings override)
   stats    --project DIR
 ";
 
@@ -157,9 +159,10 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
         }
         "compare" => compare(&project, &s, a, &prog)?,
         "install" => {
-            let root = a.get("--mods-root").ok_or_else(|| wwhd_tex::Error::Format("--mods-root is required".into()))?;
+            let (root, rule) = resolve_mods_root(a.get("--mods-root").map(PathBuf::from), &s, &Env::from_process())?;
+            println!("mods folder: {} ({})", root.display(), rule.label());
             let kind = InstallKind::parse(a.get("--kind").as_deref().unwrap_or("archives"))?;
-            let done = install(&project, Path::new(&root), !a.flag("--no-enable"), kind)?;
+            let done = install(&project, &root, !a.flag("--no-enable"), kind)?;
             println!("installed: {:?}", done.ids);
             for w in &done.warnings {
                 println!("warning: {w}");
@@ -358,6 +361,23 @@ impl InstallKind {
     }
 }
 
+/// The folder `install` writes to: `--mods-root`, else the Settings folder, else the recomp's own choice
+/// (`mods_dir::detect`, with the game folder from Settings or `build/game` beside the disc dump). It must exist: the
+/// CLI never creates it and never guesses another place.
+pub fn resolve_mods_root(arg: Option<PathBuf>, s: &Settings, env: &Env) -> Result<(PathBuf, ModsRule)> {
+    let explicit = arg.or_else(|| s.mods_root.clone());
+    let game = s.game_exe.clone().or_else(|| mods_dir::game_exe_near_disc(&s.disc_root));
+    let (root, rule) = mods_dir::detect(explicit.as_deref(), game.as_deref(), env);
+    if !root.is_dir() {
+        return Err(wwhd_tex::Error::Format(format!(
+            "mods folder {} ({}) does not exist; start the game once, or pass --mods-root",
+            root.display(),
+            rule.label()
+        )));
+    }
+    Ok((root, rule))
+}
+
 /// What `install` did.
 #[derive(Debug, Default)]
 pub struct Installed {
@@ -458,6 +478,34 @@ mod tests {
         let db = serde_json::json!({"format_version": 1, "active": "Default", "profiles": {"Default": {"enabled": enabled}}});
         std::fs::write(mods.join("profiles.json"), serde_json::to_vec(&db).unwrap()).unwrap();
         (root, p, mods)
+    }
+
+    fn env_with_manager(dir: &Path) -> Env {
+        Env { manager_dir: Some(dir.as_os_str().to_owned()), ..Env::default() }
+    }
+
+    #[test]
+    fn mods_root_argument_beats_settings_beats_detection() {
+        let root = std::env::temp_dir().join(format!("wwhd-resolve-{}", std::process::id()));
+        let (arg, set, det) = (root.join("arg"), root.join("settings"), root.join("detected"));
+        for d in [&arg, &set, &det] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let s = Settings { mods_root: Some(set.clone()), ..Settings::default() };
+        let env = env_with_manager(&det);
+        assert_eq!(resolve_mods_root(Some(arg.clone()), &s, &env).unwrap(), (arg, ModsRule::Explicit));
+        assert_eq!(resolve_mods_root(None, &s, &env).unwrap(), (set, ModsRule::Explicit));
+        let none = Settings::default();
+        assert_eq!(resolve_mods_root(None, &none, &env).unwrap(), (det, ModsRule::ManagerEnv));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn detected_folder_that_does_not_exist_is_an_error_naming_the_path_and_is_not_created() {
+        let missing = std::env::temp_dir().join(format!("wwhd-resolve-missing-{}", std::process::id())).join("ModManager");
+        let err = resolve_mods_root(None, &Settings::default(), &env_with_manager(&missing)).unwrap_err().to_string();
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(!missing.exists());
     }
 
     fn enabled(mods: &Path) -> serde_json::Value {

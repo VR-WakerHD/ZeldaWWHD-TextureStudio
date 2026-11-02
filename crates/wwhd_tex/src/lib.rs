@@ -10,6 +10,7 @@ pub mod error;
 pub mod gx2;
 pub mod inventory;
 pub mod jobs;
+pub mod mods_dir;
 pub mod mips;
 pub mod pipeline;
 pub mod policy;
