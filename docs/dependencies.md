@@ -1,7 +1,9 @@
 # Dependencies and licences
 
-Checked 2026-11-02. Nothing is bundled in the repository except `third_party/wiiu_swizzle` (MIT, with its
-licence file). Upscaler tools and models are downloaded by the user from the official release pages.
+Checked 2026-11-02. Bundled in the repository: `third_party/wiiu_swizzle` (MIT, with its licence file) and two
+upscaler releases whose code and model licences allow redistribution, Real-ESRGAN ncnn Vulkan and waifu2x ncnn
+Vulkan (Windows builds, with their licence files; `tools/upscalers/README.md`). Real-CUGAN and RealSR are downloaded
+by the user from the official release pages.
 
 ## Rust crates (built from source via crates.io)
 
@@ -27,7 +29,7 @@ licence file). Upscaler tools and models are downloaded by the user from the off
 
 wiiu_swizzle itself credits decaf-emu/addrlib (Mesa-derived) and Cemu constants.
 
-## Upscaler tools (user download, not redistributed)
+## Upscaler tools (Real-ESRGAN and waifu2x bundled; Real-CUGAN and RealSR user download)
 
 | Tool | Release | Licence | Models included | Backend | Notes |
 |---|---|---|---|---|---|
@@ -45,9 +47,12 @@ c6e08d46c11704b1e3a1ada9ddd591cb5005f52f132136c8633ba25def400e01 realcugan-ncnn-
 db77ca8247642e2b694f1ce0fed3d91f557b75464ff343f5168465fe414223b3 realsr-ncnn-vulkan-20220728-windows.zip
 ```
 
-Model weight licences follow their projects (Real-ESRGAN BSD-3-Clause; waifu2x MIT; Real-CUGAN MIT; RealSR
-per Tencent's repository). Redistributing model files with this app has not been cleared, so they are not
-bundled.
+Model weight licences follow their projects: Real-ESRGAN BSD-3-Clause (bundled, `LICENSE-Real-ESRGAN.txt` copied
+from xinntao/Real-ESRGAN, as the release archive has none) and waifu2x MIT (bundled). Real-CUGAN's models come from
+bilibili/ailab, which has no licence file, and RealSR's follow Tencent's RealSR terms; neither is cleared for
+redistribution, so those two are not bundled. The bundled releases ship without their demo images/video and
+without `vcomp140d.dll` (a Microsoft debug DLL that is not redistributable); `vcomp140.dll` is Microsoft's
+redistributable OpenMP runtime.
 
 ## Backend choice
 

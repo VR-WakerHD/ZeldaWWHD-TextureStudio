@@ -46,16 +46,18 @@ cargo build --release
 
 ### Upscaler tools (optional, for AI models)
 
-Download the official releases into `tools/upscalers/` (each zip extracted into its own folder):
+The Windows builds of Real-ESRGAN (the default AI model) and waifu2x are included in `tools/upscalers/`, with their
+licences. Real-CUGAN and RealSR are not (their model licences are not cleared); download them into `tools/upscalers/`
+(each zip extracted into its own folder) if you want them. On Linux, download all of them:
 
-| Tool | Official release |
-|---|---|
-| Real-ESRGAN ncnn Vulkan (with models) | https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0 (`realesrgan-ncnn-vulkan-20220424-<os>.zip`) |
-| waifu2x ncnn Vulkan | https://github.com/nihui/waifu2x-ncnn-vulkan/releases/tag/20250915 |
-| Real-CUGAN ncnn Vulkan | https://github.com/nihui/realcugan-ncnn-vulkan/releases/tag/20220728 |
-| RealSR ncnn Vulkan | https://github.com/nihui/realsr-ncnn-vulkan/releases/tag/20220728 |
+| Tool | Official release | In this repository |
+|---|---|---|
+| Real-ESRGAN ncnn Vulkan (with models) | https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0 (`realesrgan-ncnn-vulkan-20220424-<os>.zip`) | Windows build |
+| waifu2x ncnn Vulkan | https://github.com/nihui/waifu2x-ncnn-vulkan/releases/tag/20250915 | Windows build |
+| Real-CUGAN ncnn Vulkan | https://github.com/nihui/realcugan-ncnn-vulkan/releases/tag/20220728 | no |
+| RealSR ncnn Vulkan | https://github.com/nihui/realsr-ncnn-vulkan/releases/tag/20220728 | no |
 
-Without them, every class falls back to Lanczos-3 (logged). Custom ESRGAN-family ncnn models
+See `tools/upscalers/README.md`. Without any AI tool, every class falls back to Lanczos-3 (logged). Custom ESRGAN-family ncnn models
 (`name.param` + `name.bin`, 4×) can be placed in `tools/upscalers/custom-models/`.
 
 ## Use

@@ -1,7 +1,17 @@
 target/
-tools/upscalers/
 *.txt.bak
 err.txt
 gate.txt
 /studio_project/
 .superpowers/
+
+# Upscaler tools: only the ones whose code and model licences allow redistribution are in the repository
+# (tools/upscalers/README.md). The others, downloaded archives, demo media and debug DLLs stay local.
+tools/upscalers/*
+!tools/upscalers/README.md
+!tools/upscalers/realesrgan-ncnn-vulkan-20220424-windows/
+!tools/upscalers/waifu2x-ncnn-vulkan-20250915-windows/
+tools/upscalers/**/*.jpg
+tools/upscalers/**/*.png
+tools/upscalers/**/*.mp4
+tools/upscalers/**/vcomp140d.dll
