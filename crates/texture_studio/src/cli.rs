@@ -126,8 +126,7 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
         }
         "upscale" => {
             let inv = load_inventory(&project)?;
-            let plans = policy::plan_all(&inv, &s, &d);
-            let tasks = pipeline::upscale_tasks(&inv, &plans, |i| s.file_selected(&inv.textures[i].id.location.file));
+            let tasks = pipeline::all_upscale_tasks(&inv, &s, &d);
             pipeline::upscale(&project, &s, &inv, &d, &tasks, &prog)?;
         }
         "export" => {
@@ -155,8 +154,7 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
             };
             pipeline::extract(&project, &mut inv, &prog)?;
             inv.save(&project.inventory_path())?;
-            let plans = policy::plan_all(&inv, &s, &d);
-            let tasks = pipeline::upscale_tasks(&inv, &plans, |i| s.file_selected(&inv.textures[i].id.location.file));
+            let tasks = pipeline::all_upscale_tasks(&inv, &s, &d);
             pipeline::upscale(&project, &s, &inv, &d, &tasks, &prog)?;
             let r = pipeline::export(&project, &s, &inv, &d, &prog)?;
             print_report(&r);

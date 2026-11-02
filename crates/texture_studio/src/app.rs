@@ -406,8 +406,7 @@ impl App {
                 let _ = tx.send(Msg::Inventory(inv.clone()));
             }
             if upscale_all {
-                let plans = policy::plan_all(&inv, &s, &d);
-                let tasks = pipeline::upscale_tasks(&inv, &plans, |i| s.file_selected(&inv.textures[i].id.location.file));
+                let tasks = pipeline::all_upscale_tasks(&inv, &s, &d);
                 pipeline::upscale(&p, &s, &inv, &d, &tasks, prog)?;
             }
             if export {

@@ -262,14 +262,28 @@ pub struct UpscaleTask {
 
 /// Unique (key, backend, scale) tasks for the given plans.
 pub fn upscale_tasks(inv: &Inventory, plans: &[Plan], filter: impl Fn(usize) -> bool) -> Vec<UpscaleTask> {
+    upscale_tasks_for(inv, &[plans], filter)
+}
+
+/// Unique (key, backend, scale) tasks over several plan sets, e.g. the rebuilt archives' and the runtime pack's,
+/// which differ where the archive heap budget or exclusions hold a texture back.
+pub fn upscale_tasks_for(inv: &Inventory, plan_sets: &[&[Plan]], filter: impl Fn(usize) -> bool) -> Vec<UpscaleTask> {
     let mut seen = std::collections::HashSet::new();
     let mut v = Vec::new();
-    for (i, (t, pl)) in inv.textures.iter().zip(plans).enumerate() {
-        if pl.upscales() && filter(i) && seen.insert((t.key.clone(), pl.backend.key(), pl.scale)) {
-            v.push(UpscaleTask { key: t.key.clone(), record: i, scale: pl.scale, backend: pl.backend.clone() });
+    for plans in plan_sets {
+        for (i, (t, pl)) in inv.textures.iter().zip(plans.iter()).enumerate() {
+            if pl.upscales() && filter(i) && seen.insert((t.key.clone(), pl.backend.key(), pl.scale)) {
+                v.push(UpscaleTask { key: t.key.clone(), record: i, scale: pl.scale, backend: pl.backend.clone() });
+            }
         }
     }
     v
+}
+
+/// Everything either export needs: the rebuilt archives' plans and the runtime pack's.
+pub fn all_upscale_tasks(inv: &Inventory, s: &Settings, d: &Decisions) -> Vec<UpscaleTask> {
+    let (archives, runtime) = (crate::policy::plan_all(inv, s, d), crate::policy::plan_all_runtime(inv, s, d));
+    upscale_tasks_for(inv, &[&archives, &runtime], |i| s.file_selected(&inv.textures[i].id.location.file))
 }
 
 /// Stage 2: upscale tasks whose results are not cached yet.

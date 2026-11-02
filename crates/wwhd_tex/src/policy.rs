@@ -345,4 +345,21 @@ mod tests {
         assert!(!plan_all(&inv, &s, &Decisions::default())[0].upscales());
         assert_eq!(plan_all_runtime(&inv, &s, &Decisions::default())[0].scale, 4);
     }
+
+    #[test]
+    fn upscaling_covers_what_only_the_runtime_pack_needs() {
+        // Excluded from the rebuilt archives, wanted at x4 by the runtime pack: one task, at x4.
+        let inv = inventory(tex("Common/Misc/Misc.szs", "k1", 256, Class::Rock));
+        let tasks = crate::pipeline::all_upscale_tasks(&inv, &Settings::default(), &Decisions::default());
+        assert_eq!(tasks.iter().map(|t| t.scale).collect::<Vec<_>>(), vec![4]);
+        // Both plans agree: still one task, not two.
+        let inv = inventory(tex("a.szs", "k1", 256, Class::Rock));
+        let s = Settings { exclude_files: vec![], ..Settings::default() };
+        assert_eq!(crate::pipeline::all_upscale_tasks(&inv, &s, &Decisions::default()).len(), 1);
+        // Held native by the archive budget, x4 for the runtime pack: the x4 result is still made.
+        let s = Settings { exclude_files: vec![], archive_growth_max_bytes: 1, ..Settings::default() };
+        let mut scales: Vec<u32> = crate::pipeline::all_upscale_tasks(&inv, &s, &Decisions::default()).iter().map(|t| t.scale).collect();
+        scales.sort();
+        assert_eq!(scales, vec![4]);
+    }
 }
