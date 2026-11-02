@@ -203,6 +203,13 @@ pub const PACKAGE_MAX_BYTES: u64 = 4 << 30;
 /// Above this estimate of resident texture memory the export warns.
 pub const VRAM_WARN_BYTES: u64 = 8 << 30;
 
+/// The largest max side the runtime pack is safe at in VR: the recomp makes a replacement in one frame when the game
+/// first draws it, and one larger than this can cost that frame.
+pub const VR_MAX_SIDE: u32 = 4096;
+
+/// The recomp's mod manager version that knows `kind: "textures"` packages.
+pub const MINIMUM_MANAGER_VERSION: &str = "1.7.0";
+
 /// Bytes before the level data of a DDS written by `write_dds`.
 pub const DDS_HEADER_BYTES: u64 = 148;
 
@@ -243,6 +250,15 @@ pub fn vram_warning(bytes: u64) -> Option<String> {
         format!(
             "estimated texture memory is {:.1} GiB, above 8 GiB; the game keeps only what its budget allows resident",
             bytes as f64 / (1u64 << 30) as f64
+        )
+    })
+}
+
+/// The warning for a runtime pack made at `max_dim` (Settings → Max side), or `None` up to `VR_MAX_SIDE`.
+pub fn max_side_warning(max_dim: u32) -> Option<String> {
+    (max_dim > VR_MAX_SIDE).then(|| {
+        format!(
+            "max side is {max_dim} px: a replacement larger than {VR_MAX_SIDE} px is made in one frame when the game first draws it and can cost a VR frame; use max side {VR_MAX_SIDE} for VR until the recomp spreads large uploads over frames"
         )
     })
 }
@@ -456,6 +472,7 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
                 "game_id": "wwhd-usa",
                 "kind": "textures",
                 "textures_dir": "textures",
+                "minimum_manager_version": MINIMUM_MANAGER_VERSION,
             }))?,
         )?;
         report.packages.push((id, *size, list.len()));
@@ -466,6 +483,7 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
     report.bytes = report.packages.iter().map(|p| p.1).sum();
     report.vram_estimate_bytes = report.bytes.saturating_sub(report.entries as u64 * DDS_HEADER_BYTES);
     report.warnings.extend(vram_warning(report.vram_estimate_bytes));
+    report.warnings.extend(max_side_warning(s.max_dim));
     write_atomic(&p.reports_dir().join("runtime_export_report.json"), &serde_json::to_vec_pretty(&report)?)?;
     progress.log(format!(
         "Runtime pack finished: {} entries in {} packages ({} MiB, ~{} MiB resident), {} skipped, {} errors",
@@ -813,7 +831,7 @@ mod tests {
         assert_eq!(
             manifest,
             serde_json::json!({"format_version": 1, "id": id, "name": "WWHD 4K Textures Runtime (1/1)", "version": "1.0.0",
-                "game_id": "wwhd-usa", "kind": "textures", "textures_dir": "textures"})
+                "game_id": "wwhd-usa", "kind": "textures", "textures_dir": "textures", "minimum_manager_version": "1.7.0"})
         );
         let index = index_of(&dir);
         assert_eq!(index["format_version"], 1);
@@ -849,6 +867,11 @@ mod tests {
         let again = export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
         assert_eq!((again.entries, again.bytes), (r.entries, r.bytes));
         assert_eq!(index_of(&dir), index);
+        // at a max side above 4096 the export warns (a large first-sight replacement can cost a VR frame)
+        let mut wide = rig.s.clone();
+        wide.max_dim = 8192;
+        let w = export_runtime(&rig.p, &wide, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        assert!(w.warnings.iter().any(|w| w.contains("max side 4096 for VR")), "{:?}", w.warnings);
     }
 
     #[test]
@@ -945,6 +968,16 @@ mod tests {
             let (w, h) = (e["width"].as_u64().unwrap() as u32, e["height"].as_u64().unwrap() as u32);
             let bytes = std::fs::read(dir.join("textures").join(e["file"].as_str().unwrap())).unwrap();
             assert_eq!((rd(&bytes, 16), rd(&bytes, 12)), (w * 2, h * 2), "{e}");
+        }
+    }
+
+    #[test]
+    fn the_max_side_warning_starts_above_4096() {
+        assert_eq!(max_side_warning(2048), None);
+        assert_eq!(max_side_warning(4096), None);
+        for side in [8192, 16384] {
+            let w = max_side_warning(side).unwrap();
+            assert!(w.contains(&format!("{side} px")) && w.contains("max side 4096 for VR"), "{w}");
         }
     }
 

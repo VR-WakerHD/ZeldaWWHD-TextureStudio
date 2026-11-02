@@ -137,6 +137,10 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
         }
         "export-runtime" => {
             let inv = load_inventory(&project)?;
+            // (repeated in the report at the end) said first too, as a long export is under way
+            if let Some(w) = runtime_pack::max_side_warning(s.max_dim) {
+                println!("warning: {w}");
+            }
             let r = runtime_pack::export_runtime(&project, &s, &inv, &d, &prog)?;
             print_runtime_report(&r);
         }

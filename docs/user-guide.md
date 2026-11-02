@@ -52,7 +52,9 @@ its own rebuilt copy.
 1. **Policy** (Settings → Resolution policy). Scales are Native, ×2, ×4, ×8, ×16 and ×32. A texture's scale comes
    from, in this order, its own setting (Assets → scale override), its class's setting (Settings → Models per
    class → Scale) and the global scale (default ×4). **Max side** (2048, 4096 (default), 8192 or 16384 px) limits
-   the output's longest side. A scale that would pass it steps down one factor at a time (×32 → ×16 → … → ×2),
+   the output's longest side; for a runtime pack played in VR use 4096 until the recomp spreads large uploads over
+   frames (a larger replacement is made in one frame when the game first draws it, and Settings and Export warn).
+   A scale that would pass it steps down one factor at a time (×32 → ×16 → … → ×2),
    never skipping; a texture stays native only when even ×2 would exceed the max side. The same stepping applies
    when a model fails at a large scale or its result fails the consistency check (below 22 dB): the next lower
    scale is tried, and a conventional filter is used only after ×2 failed with the class's model. Textures smaller

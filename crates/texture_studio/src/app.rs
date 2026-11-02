@@ -1373,6 +1373,9 @@ impl App {
                     }
                 });
             });
+            if let Some(w) = runtime_pack::max_side_warning(s.max_dim) {
+                ui.label(RichText::new(format!("Runtime pack: {w}.")).color(Color32::from_rgb(230, 160, 80)));
+            }
             ui.label(
                 RichText::new("A texture whose scale would pass the max side steps down (×32 → ×16 → … → ×2); only a texture that cannot even double stays native. A class below, or a texture in Assets, can set its own scale.")
                     .weak(),
@@ -1556,6 +1559,9 @@ impl App {
             ));
             if let Some(w) = runtime_pack::vram_warning(t.vram) {
                 ui.label(RichText::new(format!("Warning: {w}. The export still runs.")).color(Color32::from_rgb(230, 160, 80)));
+            }
+            if let Some(w) = runtime_pack::max_side_warning(self.settings.max_dim) {
+                ui.label(RichText::new(format!("Warning: {w} (Settings → Max side). The export still runs.")).color(Color32::from_rgb(230, 160, 80)));
             }
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy(), egui::Button::new("Export runtime pack")).clicked() {
