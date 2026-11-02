@@ -268,6 +268,13 @@ pub fn run(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path
 /// x4-only model is x4, x4, then x4 reduced to x2). Jobs sharing a wanted scale
 /// go through each pass together; every pass pads and crops on its own.
 fn run_ncnn_passes(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path, jobs: &[Job], cancel: &AtomicBool) -> Result<Vec<Output>> {
+    run_passes(b, jobs, &mut |pass, run| run_ncnn(b, tools, gpu, tile, scratch, pass, cancel, run))
+}
+
+/// The pass loop behind [`run_ncnn_passes`]; `single` runs one pass over a
+/// batch (jobs carry the kept scale, the second argument is the run scale) and
+/// returns outputs of the kept size.
+fn run_passes(b: &BackendChoice, jobs: &[Job], single: &mut dyn FnMut(&[Job], u32) -> Result<Vec<Output>>) -> Result<Vec<Output>> {
     let mut results: Vec<Option<Output>> = (0..jobs.len()).map(|_| None).collect();
     let mut scales: Vec<u32> = jobs.iter().map(|j| j.scale).collect();
     scales.sort_unstable();
@@ -281,7 +288,7 @@ fn run_ncnn_passes(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratc
                 .zip(cur)
                 .map(|(&i, o)| Job { name: jobs[i].name.clone(), w: o.w, h: o.h, rgba: o.rgba, scale: kept, edge: jobs[i].edge })
                 .collect();
-            cur = run_ncnn(b, tools, gpu, tile, scratch, &pass, cancel, run)?;
+            cur = single(&pass, run)?;
         }
         for (&i, o) in idx.iter().zip(cur) {
             results[i] = Some(o);
@@ -459,6 +466,38 @@ mod tests {
     fn filters_run_in_one_step() {
         assert_eq!(BackendChoice::Filter(Filter::Lanczos3).passes(32), [(32, 32)]);
         assert_eq!(BackendChoice::RealEsrgan("realesrgan-x4plus".into()).passes(32), [(4, 4), (4, 4), (4, 2)]);
+    }
+
+    #[test]
+    fn passes_chain_and_groups_keep_their_jobs() {
+        // A x4-only model on a x32 job (4,4,4->2) and a x8 job (4,4->2), in one batch.
+        let b = BackendChoice::Custom("fake".into());
+        let mk = |name: &str, scale: u32, v: u8| Job { name: name.into(), w: 2, h: 2, rgba: vec![v; 16], scale, edge: Edge::Wrap };
+        let jobs = [mk("a32", 32, 10), mk("b8", 8, 20), mk("c32", 32, 30)];
+        let mut calls: Vec<(u32, Vec<(String, u32, u32, u8)>)> = Vec::new();
+        let out = run_passes(&b, &jobs, &mut |pass, run| {
+            calls.push((run, pass.iter().map(|j| (j.name.clone(), j.w, j.scale, j.rgba[0])).collect()));
+            // Fake model: every pixel +1 per pass so chaining is visible; result at the kept size.
+            Ok(pass
+                .iter()
+                .map(|j| Output { w: j.w * j.scale, h: j.h * j.scale, rgba: vec![j.rgba[0] + 1; (j.w * j.scale * j.h * j.scale * 4) as usize] })
+                .collect())
+        })
+        .unwrap();
+        let n = |s: &str, w: u32, sc: u32, v: u8| (s.to_string(), w, sc, v);
+        assert_eq!(
+            calls,
+            vec![
+                // x8 group first (scales ascending): 2 -> 8 -> 16 ... (4,4) then (4,2)
+                (4, vec![n("b8", 2, 4, 20)]),
+                (4, vec![n("b8", 8, 2, 21)]),
+                (4, vec![n("a32", 2, 4, 10), n("c32", 2, 4, 30)]),
+                (4, vec![n("a32", 8, 4, 11), n("c32", 8, 4, 31)]),
+                (4, vec![n("a32", 32, 2, 12), n("c32", 32, 2, 32)]),
+            ]
+        );
+        assert_eq!((out[0].w, out[1].w, out[2].w), (64, 16, 64));
+        assert_eq!((out[0].rgba[0], out[1].rgba[0], out[2].rgba[0]), (13, 22, 33), "each pass fed the next, results back in job order");
     }
 
     #[test]

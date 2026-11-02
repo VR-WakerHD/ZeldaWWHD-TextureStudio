@@ -234,6 +234,15 @@ pub fn find_upscaled(p: &Project, backend_key: &str, hash: &str, scale: u32) -> 
     None
 }
 
+/// Drop the cached upscale for a planned scale (the stepped-down result
+/// included, PNG and record) so the next run starts over. Returns the PNG removed.
+pub fn remove_upscaled(p: &Project, backend_key: &str, hash: &str, scale: u32) -> Option<PathBuf> {
+    let (png, _) = find_upscaled(p, backend_key, hash, scale)?;
+    let _ = std::fs::remove_file(meta_path(&png));
+    let _ = std::fs::remove_file(&png);
+    Some(png)
+}
+
 /// Effective backend for a class: normal maps and ramps never go to AI models.
 fn effective(class: Class, b: &BackendChoice) -> BackendChoice {
     match class {
@@ -1071,6 +1080,9 @@ mod tests {
         std::fs::write(meta_path(&png), serde_json::to_vec(&meta).unwrap()).unwrap();
         assert_eq!(find_upscaled(&p, be, &hash, 32), Some((png.clone(), 8)));
         assert_eq!(find_upscaled(&p, be, &hash, 16), None, "recorded for x32 only");
+        assert_eq!(remove_upscaled(&p, be, &hash, 32), Some(png.clone()));
+        assert!(!png.exists() && !meta_path(&png).exists());
+        assert_eq!(find_upscaled(&p, be, &hash, 32), None, "regenerate really starts over");
         let _ = std::fs::remove_dir_all(&root);
     }
 

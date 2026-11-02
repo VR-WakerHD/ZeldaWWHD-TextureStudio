@@ -365,8 +365,9 @@ impl App {
         // Force a fresh run: drop cached results of this model for these textures.
         for &i in &records {
             if plans[i].upscales() {
-                let path = p.upscaled_path(&plans[i].backend.key(), &inv.textures[i].key, plans[i].scale);
-                let _ = std::fs::remove_file(&path);
+                // Also removes a stepped-down result (e.g. the x16 file of a x32 plan).
+                let path = pipeline::remove_upscaled(&p, &plans[i].backend.key(), &inv.textures[i].key, plans[i].scale)
+                    .unwrap_or_else(|| p.upscaled_path(&plans[i].backend.key(), &inv.textures[i].key, plans[i].scale));
                 if let Some(c) = self.images.as_mut() {
                     c.invalidate(&path);
                 }
