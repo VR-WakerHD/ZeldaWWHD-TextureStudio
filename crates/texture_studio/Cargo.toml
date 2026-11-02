@@ -1,0 +1,11 @@
+[package]
+name = "texture_studio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37.0"
+image = "0.25.10"
+rfd = "0.17.2"
+serde_json = "1.0.154"
+wwhd_tex = { version = "0.1.0", path = "../wwhd_tex" }

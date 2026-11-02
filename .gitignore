@@ -1,0 +1,7 @@
+target/
+tools/upscalers/
+*.txt.bak
+err.txt
+gate.txt
+/studio_project/
+.superpowers/
