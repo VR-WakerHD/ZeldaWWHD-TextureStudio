@@ -258,6 +258,21 @@ and only runs the new scales.
   (they existed for guest heaps); split into packages of ≤ 4 GiB; writes `manifest.json` (`kind: textures`).
 - The install step enables the texture packages and warns when rebuilt-archive packages are enabled too (their
   textures no longer match the keys; harmless, but wasted memory).
+- **Mods folder auto-detection (user, 2026-11-02).** Install finds the recomp's mod manager folder by itself,
+  in the same order the recomp uses (`runtime/src/mods/packages.cpp` initialize, `runtime/src/platform/host.h`
+  `config_dir`):
+  1. `WWHD_MOD_MANAGER_DIR`, if set.
+  2. `WWHD_USER_DIR`/ModManager, if set.
+  3. Portable mode: a `portable.txt` next to the game's `wwhd.exe` → `<exe folder's parent>/user/ModManager`.
+     The game folder comes from Settings (new *Game executable* field), else from `build/game` next to the disc
+     folder's recomp checkout when present.
+  4. Windows: `%APPDATA%\WWHD\ModManager`. macOS: `~/Library/Application Support/WWHD/ModManager`. Linux:
+     `$XDG_CONFIG_HOME/wwhd/ModManager`, else `~/.config/wwhd/ModManager`.
+  - The Export/Install view shows the detected folder and which rule found it, and whether it exists and holds a
+    `profiles.json`.
+  - A manual folder in Settings overrides detection. `--mods-root` overrides both on the command line.
+  - If the detected folder doesn't exist, install asks before creating it (GUI) or fails with the path it tried
+    (CLI). It never guesses a different location.
 - Encode cache shared with the archive export (same blake3 cache keys plus the output format).
 
 ## Errors and fallbacks

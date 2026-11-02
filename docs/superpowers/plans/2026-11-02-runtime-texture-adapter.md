@@ -411,6 +411,28 @@ stats line.
   is the 16-hex-digit `key_hash` of its level-0 bytes (the recomp side is pinned by Task 7's shared constant).
 - [ ] **Step 5: Commit** (ask first).
 
+### Task 10b: Mods folder auto-detection (install)
+
+**Files:** Create `TS:crates/wwhd_tex/src/mods_dir.rs` (+ `pub mod mods_dir;`), modify `TS:crates/texture_studio/src/cli.rs`
+(`install`: `--mods-root` optional), `TS:crates/wwhd_tex/src/project.rs` (`Settings.mods_root: Option<PathBuf>`,
+`Settings.game_exe: Option<PathBuf>`, both `#[serde(default)]`).
+
+**Interfaces:**
+- `pub enum ModsRule { Explicit, ManagerEnv, UserDirEnv, Portable, Platform }`
+- `pub struct Env { pub manager_dir: Option<OsString>, pub user_dir: Option<OsString>, pub appdata: Option<OsString>, pub xdg_config: Option<OsString>, pub home: Option<OsString> }` with `Env::from_process()`.
+- `pub fn detect(explicit: Option<&Path>, game_exe: Option<&Path>, env: &Env) -> (PathBuf, ModsRule)` — order as the
+  spec's "Mods folder auto-detection"; pure (no process env inside), so it's testable.
+
+- [ ] **Step 1: Write failing tests:** each rule wins over the ones after it; portable needs `portable.txt` next
+  to the exe (temp dir) and gives `<parent>/user/ModManager`; Windows platform rule `APPDATA=E:\Cache\Roaming` →
+  `E:\Cache\Roaming\WWHD\ModManager`; Linux XDG set / unset (`#[cfg]`-gated per OS).
+- [ ] **Step 2: Run** `cargo test -p wwhd_tex mods_dir` → FAIL.
+- [ ] **Step 3: Implement**; CLI `install` without `--mods-root` uses `detect`, prints `mods folder: <path> (<rule>)`,
+  errors with that path if it doesn't exist.
+- [ ] **Step 4: Run** `cargo test -p wwhd_tex` → PASS.
+- [ ] **Step 5: Commit.** (Task 11's Export/Install view shows the detected folder and rule, a Settings override
+  field, and a create-folder confirmation.)
+
 ### Task 11: GUI — resolution policy, per-class scale, estimates, runtime export
 
 **Files:**
