@@ -248,11 +248,12 @@ impl App {
 
     /// Save the settings. The plans and estimates are not worked out again (a slider drag would redo them every
     /// frame): they are marked out of date until the user presses Refresh estimates.
-    fn save_settings(&mut self) {
+    /// `affects_plans` false for settings that decide no plan (the disc folder only makes a re-scan necessary).
+    fn save_settings_with(&mut self, affects_plans: bool) {
         if let Some(p) = &self.project {
             let _ = p.save_settings(&self.settings);
         }
-        self.settings_stale = true;
+        self.settings_stale |= affects_plans;
         self.env_dirty = true;
     }
 
@@ -567,6 +568,17 @@ fn checker(ui: &egui::Ui, rect: egui::Rect) {
     }
 }
 
+/// One line on whether the chosen disc folder looks like a dump (it has `content/`); used by the top bar and Settings.
+fn disc_note(ui: &mut egui::Ui, disc: &std::path::Path, info: Option<&EnvInfo>) {
+    if disc.as_os_str().is_empty() {
+        ui.label(RichText::new("Not chosen yet.").weak());
+    } else if info.is_some_and(|i| !i.disc_ok) {
+        ui.label(RichText::new("No content folder here: this does not look like a disc dump (code/, content/, meta/).").color(Color32::from_rgb(230, 160, 80)));
+    } else {
+        ui.label(RichText::new("Looks like a disc dump (has content/).").weak());
+    }
+}
+
 fn scale_text(v: u32) -> String {
     if v <= 1 { "Native".into() } else { format!("×{v}") }
 }
@@ -626,7 +638,7 @@ impl eframe::App for App {
         if self.filter_dirty {
             self.apply_filter();
         }
-        if self.env_dirty && matches!(self.view, View::Export | View::Settings) {
+        if self.env_dirty {
             self.env_info = Some(EnvInfo::detect(&self.settings, &Env::from_process()));
             self.env_dirty = false;
         }
@@ -648,13 +660,14 @@ impl eframe::App for App {
                 if ui.add_enabled(enabled, egui::Button::new("Game disc folder…")).clicked() {
                     if let Some(d) = rfd::FileDialog::new().set_title("Wind Waker HD disc folder (code/content/meta)").pick_folder() {
                         self.settings.disc_root = d;
-                        self.save_settings();
+                        self.save_settings_with(false);
                         if self.rescan_needed() {
                             self.status = "Disc folder changed: press Scan to read it (the earlier scan is of another folder).".into();
                         }
                     }
                 }
                 ui.label(RichText::new(self.settings.disc_root.display().to_string()).weak());
+                disc_note(ui, &self.settings.disc_root, self.env_info.as_ref());
             });
             ui.horizontal(|ui| {
                 let ready = self.project.is_some() && !self.busy() && !self.settings.disc_root.as_os_str().is_empty();
@@ -1274,13 +1287,7 @@ impl App {
                     }
                 }
             });
-            if s.disc_root.as_os_str().is_empty() {
-                ui.label(RichText::new("Not chosen yet.").weak());
-            } else if info.as_ref().is_some_and(|i| !i.disc_ok) {
-                ui.label(RichText::new("This folder has no content folder, so it does not look like a disc dump (code/, content/, meta/).").color(Color32::from_rgb(230, 160, 80)));
-            } else {
-                ui.label(RichText::new("Looks like a disc dump (it has a content folder).").weak());
-            }
+            disc_note(ui, &s.disc_root, info.as_ref());
             if self.rescan_needed() {
                 ui.label(RichText::new("The textures shown come from a scan of another folder. Press Scan (top bar) to read this one; it is not started automatically.").color(Color32::from_rgb(230, 160, 80)));
             }
@@ -1480,8 +1487,12 @@ impl App {
             }
         });
         if serde_json::to_string(&s).ok() != serde_json::to_string(&self.settings).ok() {
+            // Folders decide no plan: changing only those must not mark the estimates out of date.
+            let mut same = s.clone();
+            (same.disc_root, same.mods_root, same.game_exe) = (self.settings.disc_root.clone(), self.settings.mods_root.clone(), self.settings.game_exe.clone());
+            let affects_plans = serde_json::to_string(&same).ok() != serde_json::to_string(&self.settings).ok();
             self.settings = s;
-            self.save_settings();
+            self.save_settings_with(affects_plans);
         }
     }
 
@@ -1519,10 +1530,10 @@ impl App {
     }
 
     fn export_view(&mut self, ui: &mut egui::Ui) {
-        let Some(inv) = self.inv.clone() else {
+        if self.inv.is_none() {
             ui.label("Scan the disc first.");
             return;
-        };
+        }
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Two ways to deliver the upscales");
             ui.label(RichText::new("Runtime pack: the recomp swaps textures at draw time").strong());
@@ -1588,24 +1599,14 @@ impl App {
             ui.separator();
 
             ui.heading("Rebuilt archives");
-            let mut by_file: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
-            for (t, pl) in inv.textures.iter().zip(&self.plans) {
-                if pl.upscales() && self.settings.file_selected(&t.id.location.file) {
-                    let e = by_file.entry(t.id.location.file.as_str()).or_default();
-                    e.0 += policy::surface_bytes(t, 1);
-                    e.1 += policy::surface_bytes(t, pl.scale);
-                }
-            }
-            let growth: u64 = by_file.values().map(|(a, b)| b - a).sum();
-            let resident: u64 = by_file.iter().filter(|(f, _)| f.contains("permanent")).map(|(_, (a, b))| b - a).sum();
-            ui.label(format!("{} archives will be rebuilt; texture data grows by {} in total.", by_file.len(), mib(growth)));
-            ui.label(format!("Always-loaded packs (permanent*.pack) grow by {} — this memory is used all the time in game.", mib(resident)));
-            if resident > 256 << 20 {
+            let b = self.estimate.archives.clone();
+            ui.label(format!("{} archives will be rebuilt; texture data grows by {} in total.", b.archives, mib(b.growth)));
+            ui.label(format!("Always-loaded packs (permanent*.pack) grow by {} — this memory is used all the time in game.", mib(b.resident)));
+            if b.resident > 256 << 20 {
                 ui.label(RichText::new("Warning: the always-loaded packs grow a lot; if the game runs out of memory, lower the per-archive budget or the scale.").color(Color32::from_rgb(230, 160, 80)));
             }
-            let worst = by_file.iter().map(|(f, (a, b))| (b - a, *f)).max();
-            if let Some((g, f)) = worst {
-                ui.label(format!("Largest growth: {f} (+{})", mib(g)));
+            if let Some((g, f)) = &b.worst {
+                ui.label(format!("Largest growth: {f} (+{})", mib(*g)));
             }
             ui.horizontal(|ui| {
                 if ui.add_enabled(!self.busy(), egui::Button::new("Export rebuilt archives")).clicked() {

@@ -51,6 +51,19 @@ impl ClassEstimate {
 pub struct Estimate {
     pub classes: BTreeMap<Class, ClassEstimate>,
     pub total: ClassEstimate,
+    pub archives: ArchiveBudget,
+}
+
+/// What the rebuilt-archive plan does to the archives it touches (selected files only).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArchiveBudget {
+    /// Archives with at least one upscaled texture.
+    pub archives: usize,
+    /// Texture data added in all of them, and in the always-loaded `permanent*.pack` ones.
+    pub growth: u64,
+    pub resident: u64,
+    /// The archive that grows most and by how much.
+    pub worst: Option<(u64, String)>,
 }
 
 /// Per-class and total estimates for the unique textures `unique`. `plans` are the rebuilt-archive plans and
@@ -84,6 +97,20 @@ pub fn estimate(inv: &Inventory, unique: &[usize], plans: &[Plan], rt_plans: &[P
         e.vram += data;
         e.disk += data + DDS_HEADER_BYTES;
     }
+    let mut by_file: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for (t, pl) in inv.textures.iter().zip(plans) {
+        if pl.upscales() && s.file_selected(&t.id.location.file) {
+            let e = by_file.entry(t.id.location.file.as_str()).or_default();
+            e.0 += policy::surface_bytes(t, 1);
+            e.1 += policy::surface_bytes(t, pl.scale);
+        }
+    }
+    est.archives = ArchiveBudget {
+        archives: by_file.len(),
+        growth: by_file.values().map(|(a, b)| b - a).sum(),
+        resident: by_file.iter().filter(|(f, _)| f.contains("permanent")).map(|(_, (a, b))| b - a).sum(),
+        worst: by_file.iter().map(|(f, (a, b))| (b - a, f.to_string())).max(),
+    };
     let mut total = ClassEstimate::default();
     for e in est.classes.values() {
         total.add(e);
@@ -291,6 +318,28 @@ mod tests {
         let only = Settings { only_files: vec!["other".into()], ..s_with(4) };
         let (inv, unique, plans, rt) = setup(vec![tex("k1", 128, 0x31, Class::Rock)], &only);
         assert_eq!(estimate(&inv, &unique, &plans, &rt, &Decisions::default(), &only).total.replaced, 0);
+    }
+
+    #[test]
+    fn archive_budget_sums_growth_per_archive_and_respects_selection() {
+        let mut a = tex("k1", 128, 0x31, Class::Rock);
+        a.id.location.file = "Common/Pack/szs_permanent0.pack".into();
+        let b = tex("k2", 128, 0x31, Class::Rock);
+        let mut s = s_with(2);
+        s.max_growth_factor = 0.0;
+        s.archive_growth_max_bytes = u64::MAX;
+        s.file_max_bytes = u64::MAX;
+        let inv = Inventory { textures: vec![a, b], ..Inventory::default() };
+        let d = Decisions::default();
+        let (plans, rt) = (policy::plan_all(&inv, &s, &d), policy::plan_all_runtime(&inv, &s, &d));
+        let e = estimate(&inv, &[0, 1], &plans, &rt, &d, &s);
+        let one = policy::surface_bytes(&inv.textures[0], 2) - policy::surface_bytes(&inv.textures[0], 1);
+        assert!(one > 0);
+        assert_eq!((e.archives.archives, e.archives.growth, e.archives.resident), (2, 2 * one, one));
+        assert_eq!(e.archives.worst.as_ref().map(|w| w.0), Some(one));
+        let only = Settings { only_files: vec!["permanent".into()], ..s };
+        let e = estimate(&inv, &[0, 1], &plans, &rt, &d, &only);
+        assert_eq!((e.archives.archives, e.archives.growth), (1, one));
     }
 
     #[test]
