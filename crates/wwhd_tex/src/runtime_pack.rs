@@ -255,6 +255,13 @@ struct Staged {
     path: PathBuf,
 }
 
+/// The DDS path below the package's `textures` folder: named by the whole key, because textures of different
+/// format or size can share level-0 bytes (and so the hash).
+fn dds_file(key: &Key) -> String {
+    let hash = format!("{:016x}", key.3);
+    format!("{}/{hash}_{:x}_{}x{}.dds", &hash[..2], key.0, key.1, key.2)
+}
+
 /// "file/inner/leaf/texture" as the index shows it; a BFLIM leaf is its own texture name.
 fn entry_name(t: &TextureRecord) -> String {
     let mut parts = vec![t.id.location.file.clone()];
@@ -412,7 +419,7 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
         list.sort_by_key(|st| st.key.3);
         for st in list.iter() {
             let hash = format!("{:016x}", st.key.3);
-            let file = format!("{}/{hash}.dds", &hash[..2]);
+            let file = dds_file(&st.key);
             let dst = dir.join("textures").join(&file);
             std::fs::create_dir_all(dst.parent().unwrap())?;
             std::fs::rename(&st.path, &dst)?;
@@ -489,8 +496,7 @@ fn encode_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, c: &Can
         write_atomic(&cache, &write_dds(w, hh, c.fmt, &levels)?)?;
     }
     let bytes = std::fs::metadata(&cache)?.len();
-    let hash = format!("{:016x}", key.3);
-    let path = staging.join(&hash[..2]).join(format!("{hash}.dds"));
+    let path = staging.join(dds_file(&key));
     std::fs::create_dir_all(path.parent().unwrap())?;
     if std::fs::hard_link(&cache, &path).is_err() {
         // Different volume or no hard-link support: copy instead.
@@ -716,7 +722,11 @@ mod tests {
         }
         /// Writes `<file>` to the disc, adds its record under content key `key` and (when `upscaled`) its x2 PNG.
         fn add(&mut self, file: &str, key: &str, class: Class, w: u16, flim_format: u8, image: &[u8], upscaled: bool) {
-            let leaf = bflim(w, w, flim_format, image);
+            self.add_shaped(file, key, class, (w, w), flim_format, image, upscaled)
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn add_shaped(&mut self, file: &str, key: &str, class: Class, (w, h): (u16, u16), flim_format: u8, image: &[u8], upscaled: bool) {
+            let leaf = bflim(w, h, flim_format, image);
             std::fs::write(self.root.join("disc").join(file), &leaf).unwrap();
             let f = crate::bflim::Bflim::parse(&leaf).unwrap();
             let key = key.repeat(8);
@@ -733,8 +743,8 @@ mod tests {
                 classification: Classification { class, confidence: 1.0, reason: String::new(), manual: false },
             });
             if upscaled {
-                let n = w as u32 * 2;
-                save_png(&self.p.upscaled_path(&backend_key(), &key, 2), n, n, &gradient(n, n)).unwrap();
+                let (nw, nh) = (w as u32 * 2, h as u32 * 2);
+                save_png(&self.p.upscaled_path(&backend_key(), &key, 2), nw, nh, &gradient(nw, nh)).unwrap();
             }
         }
         fn runtime_dir(&self) -> std::path::PathBuf {
@@ -792,7 +802,7 @@ mod tests {
             let hash = e["hash"].as_str().unwrap();
             assert!(hash.len() == 16 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "{hash}");
             let file = e["file"].as_str().unwrap();
-            assert_eq!(file, format!("{}/{hash}.dds", &hash[..2]));
+            assert_eq!(file, format!("{}/{hash}_{:x}_16x16.dds", &hash[..2], e["format"].as_u64().unwrap()));
             assert!(!file.contains('\\') && !file.contains(".."));
             let bytes = std::fs::read(dir.join("textures").join(file)).unwrap();
             total += bytes.len() as u64;
@@ -892,6 +902,27 @@ mod tests {
         let reason = |n: &str| r.skipped.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{n} not skipped")).reason.clone();
         assert!(reason("todo.bflim").contains("not upscaled"), "{}", reason("todo.bflim"));
         assert!(reason("cube.bflim").contains("2D"), "{}", reason("cube.bflim"));
+    }
+
+    #[test]
+    fn keys_sharing_level0_bytes_but_not_shape_get_their_own_files() {
+        let mut rig = Rig::new("alias");
+        let bc1 = pattern(128, 9); // 16x16 and 32x8 BC1 are both 128 bytes
+        rig.add_shaped("a.bflim", "aa", Class::EnvironmentAlbedo, (16, 16), 0x0C, &bc1, true);
+        rig.add_shaped("b.bflim", "bb", Class::EnvironmentAlbedo, (32, 8), 0x0C, &bc1, true);
+        let r = export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        assert_eq!((r.entries, r.shared), (2, 0), "{r:?}");
+        let dir = rig.runtime_dir().join("wwhd-texture-studio-tex-1");
+        let index = index_of(&dir);
+        let entries = index["entries"].as_array().unwrap();
+        let files: HashSet<&str> = entries.iter().map(|e| e["file"].as_str().unwrap()).collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(entries[0]["hash"], entries[1]["hash"]);
+        for e in entries {
+            let (w, h) = (e["width"].as_u64().unwrap() as u32, e["height"].as_u64().unwrap() as u32);
+            let bytes = std::fs::read(dir.join("textures").join(e["file"].as_str().unwrap())).unwrap();
+            assert_eq!((rd(&bytes, 16), rd(&bytes, 12)), (w * 2, h * 2), "{e}");
+        }
     }
 
     #[test]
