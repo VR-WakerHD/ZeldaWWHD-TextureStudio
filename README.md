@@ -57,7 +57,9 @@ licences. Real-CUGAN and RealSR are not (their model licences are not cleared); 
 | Real-CUGAN ncnn Vulkan | https://github.com/nihui/realcugan-ncnn-vulkan/releases/tag/20220728 | no |
 | RealSR ncnn Vulkan | https://github.com/nihui/realsr-ncnn-vulkan/releases/tag/20220728 | no |
 
-See `tools/upscalers/README.md`. Without any AI tool, every class falls back to Lanczos-3 (logged). Custom ESRGAN-family ncnn models
+Settings → **Install Upscaling Models** (or `texture_studio --headless install-tools`) downloads any of them that is
+missing, from these official releases, checked against pinned SHA-256 sums. See `tools/upscalers/README.md`. Without
+any AI tool, every class falls back to Lanczos-3 (logged). Custom ESRGAN-family ncnn models
 (`name.param` + `name.bin`, 4×) can be placed in `tools/upscalers/custom-models/`.
 
 ## Use

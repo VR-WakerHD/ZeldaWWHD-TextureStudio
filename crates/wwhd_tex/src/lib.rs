@@ -19,6 +19,7 @@ pub mod resample;
 pub mod runtime_pack;
 pub mod sarc;
 pub mod texture;
+pub mod tools_install;
 pub mod upscale;
 pub mod yaz0;
 

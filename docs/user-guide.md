@@ -36,7 +36,9 @@ its own rebuilt copy.
   (side by side, slider, alpha, normal map) with zoom. Batch buttons apply to everything shown.
 - **Compare models**: runs the ticked models on the selected texture and shows them side by side; clicking a
   result makes that model the choice for this texture.
-- **Settings**: scan scope, resolution policy (global scale, max side, "keep native below", and a scale per class
+- **Settings**: at the top, **Upscaling models**: which AI upscalers are installed, and **Install Upscaling Models**,
+  which downloads the missing ones (Real-ESRGAN, waifu2x, Real-CUGAN, RealSR) from their official GitHub releases,
+  checks each against its pinned SHA-256 and unpacks it into the tools folder (progress and Cancel in Queue). Then: scan scope, resolution policy (global scale, max side, "keep native below", and a scale per class
   next to the model per class), GPU/tile/batch, tools folder, the recomp's mods folder and game executable,
   package and memory limits, "only archives containing" (to try one area first), debug tint. A table shows what
   the runtime pack would hold at the current policy (replacements, texels, disk, texture memory).
@@ -112,6 +114,7 @@ archive so it can be added to the defaults.
 | `export-runtime [--only TEXT,TEXT] [--debug-tint]` | runtime texture packs (`output/runtime`) from the upscales made so far |
 | `run [--disc DIR] [--only …]` | all of the above |
 | `compare --names TEXT,TEXT [--backends all\|KEY,KEY] [--crop N]` | contact sheet of models in `reports/` |
+| `install-tools [--tools DIR]` | download the missing AI upscalers into the tools folder (official releases, SHA-256 checked) |
 | `install [--mods-root DIR] [--kind archives\|runtime] [--no-enable]` | copy the packages of that kind (default `archives`) into the ModManager folder and enable them |
 | `stats` | per-class counts and sizes |
 

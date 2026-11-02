@@ -28,6 +28,8 @@ Without arguments the GUI starts. Commands:
                                                             copy packages into the recomp's ModManager folder
                                                             (found like the recomp does; --mods-root or Settings override)
   stats    --project DIR
+  install-tools --project DIR [--tools DIR]               download the missing AI upscalers (official releases,
+                                                            SHA-256 checked) into the tools folder
 ";
 
 struct Args(Vec<String>);
@@ -171,6 +173,13 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
             }
         }
         "stats" => stats(&project, &s, &d)?,
+        "install-tools" => {
+            for t in wwhd_tex::tools_install::status(&s.tools_dir) {
+                println!("{:12} {}", t.release.tool, if t.installed { "installed" } else { "missing" });
+            }
+            let got = wwhd_tex::tools_install::install_missing(&s.tools_dir, &prog)?;
+            println!("{}", if got.is_empty() { "nothing to install".to_string() } else { format!("installed: {}", got.join(", ")) });
+        }
         _ => {
             eprint!("{USAGE}");
             return Err(wwhd_tex::Error::Format(format!("unknown command {cmd}")));

@@ -161,7 +161,7 @@ pub struct Tools {
     pub dir: PathBuf,
 }
 
-fn find_file(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+pub(crate) fn find_file(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
     let rd = std::fs::read_dir(dir).ok()?;
     let mut subdirs = Vec::new();
     for e in rd.flatten() {

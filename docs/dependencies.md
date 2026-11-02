@@ -17,6 +17,9 @@ by the user from the official release pages.
 | bcdec_rs | 0.2 | MIT | BC decoder |
 | xxhash-rust | 0.8 | BSL-1.0 | texture keys: XXH3-64 of level-0 guest bytes (same hash the recomp uses at run time) |
 | blake3 | 1.8 | CC0-1.0 OR Apache-2.0 | content hashes |
+| ureq | 2 | MIT OR Apache-2.0 | HTTPS download of the official upscaler releases (rustls, webpki roots) |
+| zip | 2 (deflate only) | MIT | unpacking those releases |
+| sha2 | 0.10 | MIT OR Apache-2.0 | SHA-256 check of each release against its pin |
 | rayon | 1.12 | MIT OR Apache-2.0 | parallel scan/extract/export |
 | serde / serde_json | 1.0 | MIT OR Apache-2.0 | manifests, settings |
 | bilge (via wiiu_swizzle) | 0.2 | MIT OR Apache-2.0 | bitfields |
@@ -37,6 +40,11 @@ wiiu_swizzle itself credits decaf-emu/addrlib (Mesa-derived) and Cemu constants.
 | waifu2x-ncnn-vulkan | 20250915 | MIT | cunet, upconv_7_anime_style_art_rgb, upconv_7_photo | ncnn + Vulkan, CPU | `cunet` with noise 0 produced garbage on the RTX 5080 in testing; caught by the consistency check |
 | realcugan-ncnn-vulkan | 20220728 | MIT | models-se (2–4×), models-pro (2–3×), models-nose (2×) | ncnn + Vulkan, CPU | |
 | realsr-ncnn-vulkan | 20220728 | MIT | DF2K, DF2K_JPEG (4×) | ncnn + Vulkan, CPU | photographic; adds grain to WWHD art |
+
+Settings → Upscaling models → **Install Upscaling Models** (and `install-tools` on the command line) downloads
+the missing ones from these exact URLs and checks size and SHA-256 before unpacking (`crates/wwhd_tex/src/tools_install.rs`).
+The Linux pins were taken from the official `-ubuntu`/`-linux` archives on 2026-11-02 (waifu2x's is GitHub's own
+digest).
 
 SHA-256 of the downloaded archives (Windows):
 

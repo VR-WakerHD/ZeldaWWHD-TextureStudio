@@ -23,7 +23,7 @@ Left out: the releases' demo images and video, and `vcomp140d.dll` (a Microsoft 
 | Real-CUGAN ncnn Vulkan | https://github.com/nihui/realcugan-ncnn-vulkan/releases/tag/20220728 | code is MIT, but the models' source (bilibili/ailab) has no licence file |
 | RealSR ncnn Vulkan | https://github.com/nihui/realsr-ncnn-vulkan/releases/tag/20220728 | code is MIT, but the models follow Tencent's RealSR terms, not cleared |
 
-Unpack either into its own folder here and Texture Studio picks it up. Custom ESRGAN-family ncnn models
+Settings → **Install Upscaling Models** downloads them (and re-installs any missing tool) from these official pages, SHA-256 checked; or unpack them into their own folder here yourself. Custom ESRGAN-family ncnn models
 (`name.param` + `name.bin`, 4×) go in `custom-models/`. Both stay local (git-ignored).
 
 SHA-256 of the official archives is listed in `docs/dependencies.md`.

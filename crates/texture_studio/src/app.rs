@@ -16,6 +16,7 @@ use wwhd_tex::pipeline::{self, ExportReport, UpscaleTask};
 use wwhd_tex::policy::{self, Decisions, Plan, Review, ReviewStatus};
 use wwhd_tex::project::{Project, ScaleChoice, ScanScope, Settings, SCALES};
 use wwhd_tex::resample::Filter;
+use wwhd_tex::tools_install;
 use wwhd_tex::runtime_pack::{self, RuntimeReport};
 use wwhd_tex::upscale::{self, BackendChoice, Tools};
 
@@ -90,6 +91,8 @@ enum Msg {
     Installed(Vec<String>, Vec<String>),
     /// The upscaled-file scan finished.
     Found(derived::ScanResult),
+    /// Upscaling models installed: the tools folder changed.
+    ToolsInstalled,
     Done(String),
     Failed(String),
 }
@@ -131,6 +134,9 @@ pub struct App {
     /// Mods folder, game executable and disc folder checks; re-read when `env_dirty`.
     env_info: Option<EnvInfo>,
     env_dirty: bool,
+    /// Which supported AI upscalers are in the tools folder; re-read when `tools_dirty`.
+    tools_status: Vec<tools_install::Status>,
+    tools_dirty: bool,
     install_confirm: bool,
     /// An install waits for the user to agree to create the missing mods folder.
     create_confirm: Option<InstallKind>,
@@ -196,6 +202,8 @@ impl App {
             runtime_report: None,
             env_info: None,
             env_dirty: true,
+            tools_status: Vec::new(),
+            tools_dirty: true,
             install_confirm: false,
             create_confirm: None,
             install_warnings: Vec::new(),
@@ -466,6 +474,19 @@ impl App {
     }
 
     /// Install the packages of `kind` into the detected (or chosen) mods folder.
+    fn start_tools_install(&mut self) {
+        let dir = self.settings.tools_dir.clone();
+        self.spawn("Installing upscaling models", move |prog, tx| {
+            let got = tools_install::install_missing(&dir, prog)?;
+            let _ = tx.send(Msg::ToolsInstalled);
+            Ok(if got.is_empty() {
+                "All supported upscaling models were already installed".into()
+            } else {
+                format!("Installed {}", got.join(", "))
+            })
+        });
+    }
+
     fn start_install(&mut self, kind: InstallKind) {
         let (Some(p), Some(info)) = (self.project.clone(), self.env_info.clone()) else { return };
         let root = info.mods_path;
@@ -523,13 +544,16 @@ impl App {
                     self.filter_dirty = true;
                     self.compare_dirty = true;
                 }
+                Msg::ToolsInstalled => self.tools_dirty = true,
                 Msg::Done(s) => {
                     self.status = s;
                     self.files_changed();
+                    self.tools_dirty = true;
                 }
                 Msg::Failed(e) => {
                     self.status = format!("Stopped: {e}");
                     self.files_changed();
+                    self.tools_dirty = true;
                 }
             }
         }
@@ -640,6 +664,10 @@ impl eframe::App for App {
         if self.env_dirty {
             self.env_info = Some(EnvInfo::detect(&self.settings, &Env::from_process()));
             self.env_dirty = false;
+        }
+        if self.tools_dirty {
+            self.tools_status = tools_install::status(&self.settings.tools_dir);
+            self.tools_dirty = false;
         }
 
         egui::Panel::top("top").show(root, |ui| {
@@ -1268,10 +1296,57 @@ impl App {
         }
     }
 
+    /// Settings' first section: which AI upscalers are installed, and the button that downloads the missing ones.
+    fn models_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Upscaling models");
+        let list = self.tools_status.clone();
+        let missing: Vec<&tools_install::Status> = list.iter().filter(|t| !t.installed).collect();
+        let mib: u64 = missing.iter().map(|t| t.release.size).sum::<u64>() >> 20;
+        ui.horizontal(|ui| {
+            let can = !missing.is_empty() && !self.busy();
+            if ui
+                .add_enabled(can, egui::Button::new("Install Upscaling Models"))
+                .on_hover_text("Downloads every supported AI upscaler that is missing from the tools folder, from its official GitHub release")
+                .clicked()
+            {
+                self.start_tools_install();
+            }
+            let note = if list.is_empty() {
+                "no official upscaler builds for this operating system".to_string()
+            } else if missing.is_empty() {
+                "all supported AI upscalers are installed".to_string()
+            } else {
+                format!("downloads {} missing tool(s), about {mib} MiB", missing.len())
+            };
+            ui.label(RichText::new(note).weak());
+        });
+        egui::Grid::new("models_status").num_columns(3).show(ui, |ui| {
+            for t in &list {
+                ui.label(&t.release.tool);
+                if t.installed {
+                    ui.label(RichText::new("installed").color(Color32::from_rgb(120, 190, 120)));
+                } else {
+                    ui.label(RichText::new(format!("missing ({} MiB)", t.release.size >> 20)).color(Color32::from_rgb(230, 160, 80)));
+                }
+                ui.label(RichText::new(format!("models: {}", t.release.licence)).weak());
+                ui.end_row();
+            }
+        });
+        ui.label(
+            RichText::new(format!(
+                "Into {}. Each download is checked against the official release's SHA-256 before it is unpacked.",
+                self.settings.tools_dir.display()
+            ))
+            .weak(),
+        );
+        ui.separator();
+    }
+
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         let mut s = self.settings.clone();
         let info = self.env_info.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
+            self.models_section(ui);
             self.estimate_controls(ui);
             ui.heading("Folders");
             ui.horizontal(|ui| {
@@ -1438,6 +1513,9 @@ impl App {
                     }
                 }
             });
+            if s.tools_dir != self.settings.tools_dir {
+                self.tools_dirty = true;  // (Upscaling models: another folder's tools)
+            }
             for b in [
                 BackendChoice::RealEsrgan("realesrgan-x4plus".into()),
                 BackendChoice::Waifu2x { model: "models-cunet".into(), noise: 0 },
