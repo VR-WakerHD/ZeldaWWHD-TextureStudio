@@ -1057,7 +1057,6 @@ impl App {
             });
             ui.add(egui::Slider::new(&mut s.max_dim, 512..=8192).step_by(512.0).text("maximum output side (px)"));
             ui.add(egui::Slider::new(&mut s.min_source_dim, 1..=128).text("keep native below (px)"));
-            ui.add(egui::Slider::new(&mut s.native_from_dim, 256..=4096).step_by(256.0).text("keep native from (px)"));
             ui.heading("Models per class");
             let tools = Tools { dir: s.tools_dir.clone() };
             egui::Grid::new("backends").num_columns(2).striped(true).show(ui, |ui| {

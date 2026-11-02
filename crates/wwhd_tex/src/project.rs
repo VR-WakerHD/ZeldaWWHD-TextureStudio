@@ -38,14 +38,14 @@ pub enum ScanScope {
 pub struct Settings {
     pub disc_root: PathBuf,
     pub scope: ScanScope,
-    /// Longest output side.
+    /// Longest output side (2048, 4096, 8192 or 16384).
     pub max_dim: u32,
-    /// Preferred scale factor for eligible textures (1, 2 or 4).
+    /// Global scale factor for eligible textures: 1 (native) or one of `SCALES`.
     pub scale: u32,
+    /// Scale per class, overriding `scale`; classes not listed follow the global scale.
+    pub class_scales: Vec<(Class, ScaleChoice)>,
     /// Textures whose longest side is below this stay native (tiny ramps, dots).
     pub min_source_dim: u32,
-    /// Textures whose longest side is at least this stay native.
-    pub native_from_dim: u32,
     /// Backend per class; classes not listed use `default_backend`.
     pub backends: Vec<(Class, BackendChoice)>,
     pub default_backend: BackendChoice,
@@ -80,6 +80,26 @@ pub struct Settings {
     pub exclude_files: Vec<String>,
 }
 
+/// Scale factors a texture or class can be set to (besides native).
+pub const SCALES: [u32; 5] = [2, 4, 8, 16, 32];
+
+/// A class's scale: follow the global one, stay native, or a fixed factor from `SCALES`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScaleChoice {
+    Global,
+    Native,
+    X(u32),
+}
+
+/// Ramps keep their native resolution (their backend is `Native` too); every
+/// other class follows the global scale.
+pub fn default_class_scales() -> Vec<(Class, ScaleChoice)> {
+    crate::classify::ALL_CLASSES
+        .iter()
+        .map(|&c| (c, if c == Class::Ramp { ScaleChoice::Native } else { ScaleChoice::Global }))
+        .collect()
+}
+
 /// Archives verified on 2026-11-02 to crash or halt the game when enlarged
 /// (fixed-size heaps in the game's code).
 pub fn default_excluded() -> Vec<String> {
@@ -105,8 +125,8 @@ impl Default for Settings {
             scope: ScanScope::ContentOnly,
             max_dim: 4096,
             scale: 4,
+            class_scales: default_class_scales(),
             min_source_dim: 16,
-            native_from_dim: 2048,
             backends: crate::upscale::default_class_backends(),
             default_backend: BackendChoice::default(),
             gpu: 0,
@@ -133,6 +153,10 @@ impl Settings {
     }
     pub fn file_selected(&self, file: &str) -> bool {
         self.only_files.is_empty() || self.only_files.iter().any(|f| file.contains(f.as_str()))
+    }
+    /// The class's scale setting; `Global` when the class is not listed.
+    pub fn scale_choice_for(&self, class: Class) -> ScaleChoice {
+        self.class_scales.iter().find(|(c, _)| *c == class).map(|(_, v)| *v).unwrap_or(ScaleChoice::Global)
     }
     pub fn backend_for(&self, class: Class) -> BackendChoice {
         self.backends
