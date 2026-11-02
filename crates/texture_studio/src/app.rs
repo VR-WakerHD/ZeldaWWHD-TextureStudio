@@ -1266,9 +1266,9 @@ impl App {
             let root = PathBuf::from(&self.mods_root);
             self.install_confirm = false;
             self.spawn("Installing", move |_, tx| {
-                let ids = crate::cli::install(&p, &root, true)?;
-                let _ = tx.send(Msg::Installed(ids.clone()));
-                Ok(format!("Installed {} package(s); start the game to use them", ids.len()))
+                let done = crate::cli::install(&p, &root, true, crate::cli::InstallKind::Archives)?;
+                let _ = tx.send(Msg::Installed(done.ids.clone()));
+                Ok(format!("Installed {} package(s); start the game to use them. {}", done.ids.len(), done.warnings.join(" ")))
             });
         }
         ui.label(RichText::new("The game's Mods tab lists the packages as content mods; switching them off restores the original textures.").weak());

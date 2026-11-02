@@ -11,6 +11,7 @@
 //!   manifests/classes.json               manual classifications
 //!   manifests/replacement_manifest.json  what each exported texture replaced
 //!   output/packages/<id>/content/...     recomp content packages
+//!   output/runtime/<id>/textures/...      runtime texture packs (index.json + DDS)
 //!   output/previews/{pcvr,quest3,steam_frame}/...  non-game previews (DDS)
 //!   logs/  reports/
 //! ```
@@ -204,6 +205,10 @@ impl Project {
     pub fn encoded_path(&self, key: &str) -> PathBuf {
         self.root.join("cache/encoded").join(&key[..2]).join(format!("{key}.bin"))
     }
+    /// Encoded runtime-pack DDS, keyed like `encoded_path` plus the output format.
+    pub fn encoded_dds_path(&self, key: &str) -> PathBuf {
+        self.root.join("cache/encoded").join(&key[..2]).join(format!("{key}.dds"))
+    }
     pub fn review_path(&self) -> PathBuf {
         self.root.join("manifests/review.json")
     }
@@ -212,6 +217,10 @@ impl Project {
     }
     pub fn packages_dir(&self) -> PathBuf {
         self.root.join("output/packages")
+    }
+    /// Runtime texture packs (`textures` mod packages), one folder per package.
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.root.join("output/runtime")
     }
     pub fn previews_dir(&self) -> PathBuf {
         self.root.join("output/previews")

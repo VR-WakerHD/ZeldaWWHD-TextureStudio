@@ -3,12 +3,26 @@
 //! A texture is identified by (GX2 format, width, height, XXH3-64 of its level-0 guest bytes). The recomp hashes
 //! the same bytes at run time, so `level0_bytes` must slice exactly what the game uploads.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
 use image_dds::{ImageFormat, Mipmaps, Quality, SurfaceRgba8};
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::classify::Class;
+use crate::container::LeafKind;
 use crate::error::{bail, Error, Result};
-use crate::gx2::Gx2Surface;
+use crate::gx2::{self, Gx2Surface};
+use crate::inventory::{Inventory, TextureRecord};
+use crate::jobs::Progress;
+use crate::mips;
+use crate::pipeline;
+use crate::policy::{self, Decisions, ReviewStatus};
+use crate::project::{write_atomic, Project, Settings};
+use crate::texture;
 
 /// XXH3-64 (seed 0) of a texture's level-0 guest bytes: the hash part of the key.
 pub fn key_hash(level0: &[u8]) -> u64 {
@@ -104,12 +118,20 @@ fn encode_level(fmt: PackFormat, w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>>
     Ok(enc.data)
 }
 
+/// The most levels a `width` x `height` image can have: 1 + floor(log2(max side)), the bound the recomp's loader enforces.
+pub fn max_levels(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
 /// A DDS file (DX10 header, one 2D image) holding `levels_rgba` encoded as `fmt`, largest level first. Level `i` is
 /// `max(1, width >> i)` x `max(1, height >> i)` RGBA8; the level sizes are those the recomp's loader checks.
 pub fn write_dds(width: u32, height: u32, fmt: PackFormat, levels_rgba: &[Vec<u8>]) -> Result<Vec<u8>> {
     let mips = levels_rgba.len();
-    if width == 0 || height == 0 || mips == 0 || mips > 15 {
-        bail!("a DDS needs a non-empty size and 1..=15 levels (got {width}x{height}, {mips} levels)");
+    if width == 0 || height == 0 || mips == 0 || mips > 15 || mips as u32 > max_levels(width, height) {
+        bail!(
+            "a DDS needs a non-empty size and 1..={} levels (got {width}x{height}, {mips} levels)",
+            max_levels(width, height).min(15)
+        );
     }
     let dims = |i: usize| ((width >> i).max(1), (height >> i).max(1));
     let mut body = Vec::new();
@@ -155,6 +177,326 @@ pub fn write_dds(width: u32, height: u32, fmt: PackFormat, levels_rgba: &[Vec<u8
     put(0); // misc flags 2
     out.extend_from_slice(&body);
     Ok(out)
+}
+
+/// Package ids written by the runtime export start with this (the rebuilt-archive packages' ids end in a number
+/// straight after `pipeline::PACKAGE_PREFIX`).
+pub const RUNTIME_PREFIX: &str = "wwhd-texture-studio-tex-";
+
+/// The largest a runtime package may grow.
+pub const PACKAGE_MAX_BYTES: u64 = 4 << 30;
+
+/// Above this estimate of resident texture memory the export warns.
+pub const VRAM_WARN_BYTES: u64 = 8 << 30;
+
+/// Bytes before the level data of a DDS written by `write_dds`.
+const DDS_HEADER_BYTES: u64 = 148;
+
+/// Whether `id` names a package of the runtime export.
+pub fn is_runtime_id(id: &str) -> bool {
+    id.starts_with(RUNTIME_PREFIX)
+}
+
+/// A texture the export left out, and why.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Skipped {
+    pub name: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RuntimeReport {
+    /// Entries written: one per unique key.
+    pub entries: usize,
+    /// Textures whose key was already taken by an earlier one with the same level-0 bytes (they share its entry).
+    pub shared: usize,
+    /// Unique textures the policy keeps at native resolution (nothing to replace).
+    pub native: usize,
+    /// (package id, bytes, entries)
+    pub packages: Vec<(String, u64, usize)>,
+    /// DDS bytes written.
+    pub bytes: u64,
+    /// Texture memory if every entry were resident: the level data of all DDS files.
+    pub vram_estimate_bytes: u64,
+    pub skipped: Vec<Skipped>,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// The warning for an estimated resident size, or `None` while it is within 8 GiB.
+pub fn vram_warning(bytes: u64) -> Option<String> {
+    (bytes > VRAM_WARN_BYTES).then(|| {
+        format!(
+            "estimated texture memory is {:.1} GiB, above 8 GiB; the game keeps only what its budget allows resident",
+            bytes as f64 / (1u64 << 30) as f64
+        )
+    })
+}
+
+/// A texture chosen for the pack and the upscaled image that goes into it.
+struct Candidate {
+    record: usize,
+    fmt: PackFormat,
+    png: PathBuf,
+    /// The scale the upscale really reached (it may have stepped down from the plan).
+    scale: u32,
+}
+
+/// The identity the recomp looks a replacement up by: (GX2 format, width, height, level-0 hash).
+type Key = (u32, u32, u32, u64);
+
+/// A DDS in the staging folder.
+struct Staged {
+    key: Key,
+    name: String,
+    scale: u32,
+    dxgi: u32,
+    bytes: u64,
+    path: PathBuf,
+}
+
+/// "file/inner/leaf/texture" as the index shows it; a BFLIM leaf is its own texture name.
+fn entry_name(t: &TextureRecord) -> String {
+    let mut parts = vec![t.id.location.file.clone()];
+    parts.extend(t.id.location.inner.iter().cloned());
+    if t.kind == LeafKind::Bfres {
+        parts.push(t.id.name.clone());
+    }
+    parts.join("/")
+}
+
+/// Stage "Runtime pack": writes `textures` packages (index.json + DDS per key) from the upscales the pipeline made,
+/// with the rules of the archive export for review state and `debug_tint` but none of its guest-heap limits.
+pub fn export_runtime(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progress: &Progress) -> Result<RuntimeReport> {
+    export_runtime_with(p, s, inv, d, progress, PACKAGE_MAX_BYTES)
+}
+
+/// `export_runtime` with the package size limit as a parameter, so tests can split small exports.
+fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progress: &Progress, package_max: u64) -> Result<RuntimeReport> {
+    let plans = policy::plan_all_runtime(inv, s, d);
+    let mut report = RuntimeReport::default();
+
+    // Which unique textures get an entry.
+    let mut seen = HashSet::new();
+    let mut cands: Vec<Candidate> = Vec::new();
+    for (i, (t, plan)) in inv.textures.iter().zip(&plans).enumerate() {
+        if !s.file_selected(&t.id.location.file) || !seen.insert(t.key.clone()) {
+            continue;
+        }
+        let skip = |report: &mut RuntimeReport, reason: String| report.skipped.push(Skipped { name: entry_name(t), reason });
+        if t.surface.dim != gx2::DIM_2D || t.surface.depth > 1 {
+            skip(&mut report, format!("not a 2D single-slice texture (dim {}, {} slices)", t.surface.dim, t.surface.depth));
+            continue;
+        }
+        let class = d.classification(t).class;
+        let Some(fmt) = pack_format(t.surface.format, class) else {
+            skip(&mut report, format!("format {} has no runtime replacement", gx2::format_name(t.surface.format)));
+            continue;
+        };
+        if !plan.upscales() {
+            report.native += 1;
+            continue;
+        }
+        if d.review(&t.key).status == ReviewStatus::Pending && !s.export_unreviewed {
+            skip(&mut report, "not reviewed".into());
+            continue;
+        }
+        match pipeline::find_upscaled(p, &plan.backend.key(), &t.key, plan.scale) {
+            Some((png, scale)) => cands.push(Candidate { record: i, fmt, png, scale }),
+            None => skip(&mut report, "not upscaled yet".into()),
+        }
+    }
+
+    // Keys: the hash of each texture's level-0 guest bytes, read from the disc.
+    progress.log(format!("Runtime pack: keying {} textures", cands.len()));
+    let hashes: Mutex<HashMap<usize, u64>> = Mutex::new(HashMap::new());
+    let records: Vec<usize> = cands.iter().map(|c| c.record).collect();
+    pipeline::for_each_leaf(inv, &records, progress, |leaf, idx| {
+        for &i in idx {
+            let t = &inv.textures[i];
+            match texture::raw_data(&pipeline::info_of(t), leaf) {
+                Ok((image, _)) => {
+                    hashes.lock().unwrap().insert(i, key_hash(level0_bytes(image, &t.surface)));
+                }
+                Err(e) => progress.fail(format!("{}: {e}", t.id.key())),
+            }
+        }
+    })?;
+    if progress.cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let hashes = hashes.into_inner().unwrap();
+    let mut unique: BTreeMap<Key, &Candidate> = BTreeMap::new();
+    for c in &cands {
+        let t = &inv.textures[c.record];
+        let Some(&h) = hashes.get(&c.record) else {
+            report.skipped.push(Skipped { name: entry_name(t), reason: "could not be read from the disc".into() });
+            continue;
+        };
+        match unique.entry((t.surface.format, t.surface.width, t.surface.height, h)) {
+            std::collections::btree_map::Entry::Vacant(v) => {
+                v.insert(c);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => report.shared += 1,
+        }
+    }
+
+    // Encode every unique texture into the staging folder (cached by content, so re-exports are cheap).
+    let root = p.runtime_dir();
+    let staging = root.join("_staging");
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    progress.begin("Exporting runtime pack", unique.len());
+    let staged: Mutex<Vec<Staged>> = Mutex::new(Vec::new());
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let pool = pipeline::worker_pool()?;
+    pool.install(|| {
+        unique.par_iter().for_each(|(key, c)| {
+            if progress.cancelled() {
+                return;
+            }
+            progress.wait_if_paused();
+            let t = &inv.textures[c.record];
+            progress.item(&t.id.name);
+            match encode_one(p, s, inv, d, c, *key, &staging) {
+                Ok(st) => {
+                    staged.lock().unwrap().push(st);
+                    progress.step();
+                }
+                Err(e) => {
+                    progress.fail(format!("{}: {e}", t.id.key()));
+                    errors.lock().unwrap().push(format!("{}: {e}; kept original", t.id.key()));
+                }
+            }
+        })
+    });
+    if progress.cancelled() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(Error::Cancelled);
+    }
+    let mut staged = staged.into_inner().unwrap();
+    report.errors = errors.into_inner().unwrap();
+    report.errors.sort();
+
+    // Split into packages within the size limit (first-fit decreasing).
+    staged.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.key.cmp(&b.key)));
+    let mut bins: Vec<(u64, Vec<Staged>)> = Vec::new();
+    for st in staged {
+        if st.bytes > package_max {
+            report.errors.push(format!("{}: {} bytes exceed the package limit of {package_max} bytes; kept original", st.name, st.bytes));
+            continue;
+        }
+        match bins.iter_mut().find(|(size, _)| size + st.bytes <= package_max) {
+            Some(b) => {
+                b.0 += st.bytes;
+                b.1.push(st);
+            }
+            None => bins.push((st.bytes, vec![st])),
+        }
+    }
+    if bins.is_empty() {
+        report.warnings.push("nothing to export; earlier runtime packages were left untouched".into());
+    } else if let Ok(rd) = std::fs::read_dir(&root) {
+        // Replace the earlier packages of this tool.
+        for e in rd.flatten() {
+            if is_runtime_id(&e.file_name().to_string_lossy()) {
+                std::fs::remove_dir_all(e.path())?;
+            }
+        }
+    }
+    let (generator, count) = (format!("ZeldaWWHD Texture Studio {}", env!("CARGO_PKG_VERSION")), bins.len());
+    for (k, (size, list)) in bins.iter_mut().enumerate() {
+        let id = format!("{RUNTIME_PREFIX}{}", k + 1);
+        let dir = root.join(&id);
+        let mut entries = Vec::new();
+        list.sort_by_key(|st| st.key.3);
+        for st in list.iter() {
+            let hash = format!("{:016x}", st.key.3);
+            let file = format!("{}/{hash}.dds", &hash[..2]);
+            let dst = dir.join("textures").join(&file);
+            std::fs::create_dir_all(dst.parent().unwrap())?;
+            std::fs::rename(&st.path, &dst)?;
+            entries.push(serde_json::json!({
+                "format": st.key.0, "width": st.key.1, "height": st.key.2, "hash": hash,
+                "scale": st.scale, "file": file, "dxgi": st.dxgi, "name": st.name,
+            }));
+        }
+        write_atomic(
+            &dir.join("textures/index.json"),
+            &serde_json::to_vec_pretty(&serde_json::json!({"format_version": 1, "generator": generator, "entries": entries}))?,
+        )?;
+        write_atomic(
+            &dir.join("manifest.json"),
+            &serde_json::to_vec_pretty(&serde_json::json!({
+                "format_version": 1,
+                "id": id,
+                "name": format!("{} Runtime ({}/{count})", s.package_name, k + 1),
+                "version": "1.0.0",
+                "game_id": "wwhd-usa",
+                "kind": "textures",
+                "textures_dir": "textures",
+            }))?,
+        )?;
+        report.packages.push((id, *size, list.len()));
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+
+    report.entries = report.packages.iter().map(|p| p.2).sum();
+    report.bytes = report.packages.iter().map(|p| p.1).sum();
+    report.vram_estimate_bytes = report.bytes.saturating_sub(report.entries as u64 * DDS_HEADER_BYTES);
+    report.warnings.extend(vram_warning(report.vram_estimate_bytes));
+    write_atomic(&p.reports_dir().join("runtime_export_report.json"), &serde_json::to_vec_pretty(&report)?)?;
+    progress.log(format!(
+        "Runtime pack finished: {} entries in {} packages ({} MiB, ~{} MiB resident), {} skipped, {} errors",
+        report.entries,
+        report.packages.len(),
+        report.bytes >> 20,
+        report.vram_estimate_bytes >> 20,
+        report.skipped.len(),
+        report.errors.len()
+    ));
+    Ok(report)
+}
+
+/// Builds (or finds in the cache) the DDS of one texture and links it into `staging`.
+fn encode_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, c: &Candidate, key: Key, staging: &Path) -> Result<Staged> {
+    let t = &inv.textures[c.record];
+    let class = d.classification(t).class;
+    let png_bytes = std::fs::read(&c.png).map_err(|e| Error::Format(format!("upscaled image missing: {e}")))?;
+    // Cached by everything that determines the file, like the archive export's encode cache, plus the output format.
+    let mut h = blake3::Hasher::new();
+    h.update(b"dds-v1");
+    h.update(&png_bytes);
+    h.update(t.key.as_bytes());
+    h.update(format!("{class:?}{}{}{:?}{:?}", c.scale, s.debug_tint, t.surface, c.fmt).as_bytes());
+    let cache = p.encoded_dds_path(&h.finalize().to_hex());
+    if !cache.exists() {
+        let img = image::load_from_memory(&png_bytes).map_err(|e| Error::Format(format!("{}: {e}", c.png.display())))?.to_rgba8();
+        let (w, hh) = (img.width(), img.height());
+        let mut rgba = img.into_raw();
+        if s.debug_tint {
+            for px in rgba.chunks_exact_mut(4) {
+                px[1] /= 3;
+            }
+        }
+        if (w, hh) != (t.surface.width * c.scale, t.surface.height * c.scale) {
+            bail!("upscaled image is {w}x{hh}, expected x{}", c.scale);
+        }
+        // Original levels plus one per doubling, never more than the size allows.
+        let count = mips::upscaled_mip_count(t.surface.mip_count, c.scale).min(max_levels(w, hh));
+        let mode = pipeline::mip_mode(class, t.surface.format, &rgba);
+        let levels: Vec<Vec<u8>> = mips::chain(w, hh, rgba, count, mode).into_iter().map(|(_, _, l)| l).collect();
+        write_atomic(&cache, &write_dds(w, hh, c.fmt, &levels)?)?;
+    }
+    let bytes = std::fs::metadata(&cache)?.len();
+    let hash = format!("{:016x}", key.3);
+    let path = staging.join(&hash[..2]).join(format!("{hash}.dds"));
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    if std::fs::hard_link(&cache, &path).is_err() {
+        // Different volume or no hard-link support: copy instead.
+        std::fs::copy(&cache, &path)?;
+    }
+    Ok(Staged { key, name: entry_name(t), scale: c.scale, dxgi: c.fmt.dxgi(), bytes, path })
 }
 
 #[cfg(test)]
@@ -303,5 +645,259 @@ mod tests {
         assert!(write_dds(0, 8, f, &[vec![]]).is_err());
         let sixteen: Vec<Vec<u8>> = (0..16).map(|_| vec![0; 4]).collect();
         assert!(write_dds(1, 1, f, &sixteen).is_err());
+    }
+
+    // The recomp's check_dds allows at most 1 + floor(log2(max(w, h))) levels.
+    #[test]
+    fn level_count_is_bounded_by_the_size() {
+        let f = PackFormat::Bc7 { srgb: false };
+        let levels = |n: usize| -> Vec<Vec<u8>> { (0..n).map(|i| gradient((4u32 >> i).max(1), (2u32 >> i).max(1))).collect() };
+        assert!(write_dds(4, 2, f, &levels(3)).is_ok(), "4x2 has 3 levels: 4x2, 2x1, 1x1");
+        assert!(write_dds(4, 2, f, &levels(4)).is_err(), "a fourth level is more than the recomp accepts");
+        let one: Vec<Vec<u8>> = vec![gradient(1, 1); 2];
+        assert!(write_dds(1, 1, f, &one).is_err());
+        assert_eq!(max_levels(1, 1), 1);
+        assert_eq!(max_levels(4096, 512), 13);
+        assert_eq!(max_levels(16384, 16384), 15);
+    }
+
+    // ---- export_runtime on a small synthetic disc of BFLIM files ----
+
+    use crate::classify::Classification;
+    use crate::container::{AssetLocation, LeafKind};
+    use crate::inventory::{Inventory, TextureRecord};
+    use crate::jobs::Progress;
+    use crate::policy::Decisions;
+    use crate::project::{save_png, Project, Settings};
+    use crate::resample::Filter;
+    use crate::texture::TextureId;
+    use crate::upscale::BackendChoice;
+
+    /// A BFLIM leaf: `image` followed by the 0x28-byte FLIM footer with its `imag` block.
+    fn bflim(w: u16, h: u16, flim_format: u8, image: &[u8]) -> Vec<u8> {
+        let mut foot = vec![0u8; 0x28];
+        foot[0..4].copy_from_slice(b"FLIM");
+        foot[4..6].copy_from_slice(&0xFEFFu16.to_be_bytes());
+        foot[0x0C..0x10].copy_from_slice(&((image.len() + 0x28) as u32).to_be_bytes());
+        foot[0x14..0x18].copy_from_slice(b"imag");
+        foot[0x1C..0x1E].copy_from_slice(&w.to_be_bytes());
+        foot[0x1E..0x20].copy_from_slice(&h.to_be_bytes());
+        foot[0x22] = flim_format;
+        foot[0x24..0x28].copy_from_slice(&(image.len() as u32).to_be_bytes());
+        [image, &foot].concat()
+    }
+
+    struct Rig {
+        root: std::path::PathBuf,
+        p: Project,
+        s: Settings,
+        inv: Inventory,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn backend_key() -> String {
+        BackendChoice::Filter(Filter::Lanczos3).key()
+    }
+
+    impl Rig {
+        fn new(name: &str) -> Rig {
+            let root = std::env::temp_dir().join(format!("wwhd-runtime-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("disc")).unwrap();
+            let p = Project::open(root.join("project")).unwrap();
+            let s = Settings { scale: 2, default_backend: BackendChoice::Filter(Filter::Lanczos3), backends: vec![], ..Settings::default() };
+            let inv = Inventory { root: root.join("disc").to_string_lossy().into_owned(), ..Default::default() };
+            Rig { root, p, s, inv }
+        }
+        /// Writes `<file>` to the disc, adds its record under content key `key` and (when `upscaled`) its x2 PNG.
+        fn add(&mut self, file: &str, key: &str, class: Class, w: u16, flim_format: u8, image: &[u8], upscaled: bool) {
+            let leaf = bflim(w, w, flim_format, image);
+            std::fs::write(self.root.join("disc").join(file), &leaf).unwrap();
+            let f = crate::bflim::Bflim::parse(&leaf).unwrap();
+            let key = key.repeat(8);
+            self.inv.textures.push(TextureRecord {
+                id: TextureId { location: AssetLocation { file: file.into(), inner: vec![] }, index: 0, name: file.into() },
+                kind: LeafKind::Bflim,
+                surface: f.surface,
+                comp_sel: [0, 1, 2, 3],
+                data_hash: key.clone(),
+                key: key.clone(),
+                gate_ok: true,
+                gate_detail: String::new(),
+                decodable: true,
+                classification: Classification { class, confidence: 1.0, reason: String::new(), manual: false },
+            });
+            if upscaled {
+                let n = w as u32 * 2;
+                save_png(&self.p.upscaled_path(&backend_key(), &key, 2), n, n, &gradient(n, n)).unwrap();
+            }
+        }
+        fn runtime_dir(&self) -> std::path::PathBuf {
+            self.p.root.join("output/runtime")
+        }
+    }
+
+    fn pattern(n: usize, seed: u8) -> Vec<u8> {
+        (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    }
+
+    fn index_of(dir: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join("textures/index.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn export_writes_one_entry_per_key_and_lists_what_it_skipped() {
+        let mut rig = Rig::new("export");
+        let bc1 = pattern(128, 1); // 16x16 BC1
+        let rgba = pattern(16 * 16 * 4, 7); // 16x16 RGBA8, a UI texture
+        let r8 = pattern(16 * 16, 3); // 16x16 R8: no pack format
+        rig.add("a.bflim", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &bc1, true);
+        // the same texture in a second archive: same content key, one entry
+        rig.add("b.bflim", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &bc1, true);
+        // another content key with identical level-0 bytes: the runtime key is the same, still one entry
+        rig.add("c.bflim", "cc", Class::EnvironmentAlbedo, 16, 0x0C, &bc1, true);
+        rig.add("ui.bflim", "dd", Class::Ui, 16, 0x09, &rgba, true);
+        rig.add("r8.bflim", "ee", Class::Unknown, 16, 0x00, &r8, true);
+
+        let r = export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        assert_eq!(r.entries, 2, "{r:?}");
+        assert_eq!(r.shared, 1, "c.bflim collapses onto a.bflim's key");
+        assert_eq!(r.skipped.len(), 1, "{:?}", r.skipped);
+        assert_eq!(r.skipped[0].name, "r8.bflim");
+        assert!(r.skipped[0].reason.contains("R8"), "{:?}", r.skipped[0]);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(r.packages.len(), 1);
+        let id = "wwhd-texture-studio-tex-1";
+        assert_eq!(r.packages[0].0, id);
+
+        let dir = rig.runtime_dir().join(id);
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest,
+            serde_json::json!({"format_version": 1, "id": id, "name": "WWHD 4K Textures Runtime (1/1)", "version": "1.0.0",
+                "game_id": "wwhd-usa", "kind": "textures", "textures_dir": "textures"})
+        );
+        let index = index_of(&dir);
+        assert_eq!(index["format_version"], 1);
+        assert_eq!(index["generator"], format!("ZeldaWWHD Texture Studio {}", env!("CARGO_PKG_VERSION")));
+        let entries = index["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let mut total = 0u64;
+        for e in entries {
+            let hash = e["hash"].as_str().unwrap();
+            assert!(hash.len() == 16 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "{hash}");
+            let file = e["file"].as_str().unwrap();
+            assert_eq!(file, format!("{}/{hash}.dds", &hash[..2]));
+            assert!(!file.contains('\\') && !file.contains(".."));
+            let bytes = std::fs::read(dir.join("textures").join(file)).unwrap();
+            total += bytes.len() as u64;
+            assert_eq!((e["width"].as_u64(), e["height"].as_u64(), e["scale"].as_u64()), (Some(16), Some(16), Some(2)));
+            // DDS: 32x32, one level (a BFLIM has no stored mips), the entry's dxgi
+            assert_eq!((rd(&bytes, 16), rd(&bytes, 12), rd(&bytes, 28)), (32, 32, 1));
+            assert_eq!(rd(&bytes, 128) as u64, e["dxgi"].as_u64().unwrap());
+        }
+        let by_name = |n: &str| entries.iter().find(|e| e["name"] == n).unwrap_or_else(|| panic!("no entry named {n}"));
+        let (bc, ui) = (by_name("a.bflim"), by_name("ui.bflim"));
+        assert_eq!((bc["format"].as_u64(), bc["dxgi"].as_u64()), (Some(0x31), Some(98)));
+        assert_eq!((ui["format"].as_u64(), ui["dxgi"].as_u64()), (Some(0x1A), Some(28)), "UI stays RGBA8");
+        // the key is the hash of the guest's level-0 bytes
+        assert_eq!(bc["hash"], format!("{:016x}", key_hash(&bc1)));
+        assert_eq!(ui["hash"], format!("{:016x}", key_hash(&rgba)));
+        assert_eq!(r.bytes, total);
+        assert_eq!(r.vram_estimate_bytes, total - 2 * 148, "the estimate is the level data");
+        assert!(r.warnings.is_empty());
+        assert!(!rig.runtime_dir().join("_staging").exists(), "staging is cleaned up");
+        // a second run reuses the cache and gives the same result
+        let again = export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        assert_eq!((again.entries, again.bytes), (r.entries, r.bytes));
+        assert_eq!(index_of(&dir), index);
+    }
+
+    #[test]
+    fn debug_tint_changes_the_written_texture() {
+        let mut rig = Rig::new("tint");
+        rig.add("a.bflim", "aa", Class::Ui, 16, 0x09, &pattern(1024, 5), true);
+        let read = |rig: &Rig| {
+            let dir = rig.runtime_dir().join("wwhd-texture-studio-tex-1");
+            let e = &index_of(&dir)["entries"][0];
+            std::fs::read(dir.join("textures").join(e["file"].as_str().unwrap())).unwrap()
+        };
+        export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        let plain = read(&rig);
+        rig.s.debug_tint = true;
+        export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        let tinted = read(&rig);
+        assert_eq!(plain.len(), tinted.len());
+        // the last row of the gradient has a large green value
+        let at = 148 + (31 * 32) * 4 + 1;
+        assert!(plain[at] > 200, "{}", plain[at]);
+        assert_eq!(tinted[at], plain[at] / 3, "green is divided by three like the archive export");
+    }
+
+    #[test]
+    fn packages_split_at_the_limit_and_no_key_is_in_two() {
+        let mut rig = Rig::new("split");
+        rig.add("a.bflim", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &pattern(128, 1), true);
+        rig.add("ui.bflim", "dd", Class::Ui, 16, 0x09, &pattern(1024, 7), true);
+        // BC7 32x32 = 1024 + 148 bytes, RGBA8 32x32 = 4096 + 148: together they exceed 4300
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 4300).unwrap();
+        assert_eq!((r.entries, r.packages.len()), (2, 2), "{r:?}");
+        let mut hashes = Vec::new();
+        for (k, (id, size, n)) in r.packages.iter().enumerate() {
+            assert_eq!((id.clone(), *n), (format!("wwhd-texture-studio-tex-{}", k + 1), 1));
+            assert!(*size <= 4300);
+            let dir = rig.runtime_dir().join(id);
+            let index = index_of(&dir);
+            for e in index["entries"].as_array().unwrap() {
+                assert!(dir.join("textures").join(e["file"].as_str().unwrap()).exists());
+                hashes.push(e["hash"].as_str().unwrap().to_string());
+            }
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(m["name"], format!("WWHD 4K Textures Runtime ({}/2)", k + 1));
+        }
+        hashes.sort();
+        hashes.dedup();
+        assert_eq!(hashes.len(), 2, "no key in both packages");
+        // exporting again with a roomier limit replaces the old packages instead of leaving the second behind
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1 << 20).unwrap();
+        assert_eq!(r.packages.len(), 1);
+        assert!(!rig.runtime_dir().join("wwhd-texture-studio-tex-2").exists());
+    }
+
+    #[test]
+    fn a_texture_bigger_than_the_package_limit_is_an_error_not_a_package() {
+        let mut rig = Rig::new("toobig");
+        rig.add("ui.bflim", "dd", Class::Ui, 16, 0x09, &pattern(1024, 7), true);
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1000).unwrap();
+        assert_eq!((r.entries, r.packages.len()), (0, 0));
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(r.errors[0].contains("package limit"), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn textures_not_upscaled_or_not_2d_are_reported_and_the_rest_still_export() {
+        let mut rig = Rig::new("skips");
+        rig.add("a.bflim", "aa", Class::Ui, 16, 0x09, &pattern(1024, 1), true);
+        rig.add("todo.bflim", "bb", Class::Ui, 16, 0x09, &pattern(1024, 2), false);
+        rig.add("cube.bflim", "cc", Class::Ui, 16, 0x09, &pattern(1024, 3), true);
+        rig.inv.textures[2].surface.dim = 3;
+        rig.inv.textures[2].surface.depth = 6;
+        let r = export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        assert_eq!(r.entries, 1);
+        let reason = |n: &str| r.skipped.iter().find(|s| s.name == n).unwrap_or_else(|| panic!("{n} not skipped")).reason.clone();
+        assert!(reason("todo.bflim").contains("not upscaled"), "{}", reason("todo.bflim"));
+        assert!(reason("cube.bflim").contains("2D"), "{}", reason("cube.bflim"));
+    }
+
+    #[test]
+    fn the_vram_warning_starts_above_eight_gib() {
+        assert_eq!(vram_warning(8 << 30), None);
+        let w = vram_warning((8 << 30) + 1).unwrap();
+        assert!(w.contains("8 GiB"), "{w}");
     }
 }

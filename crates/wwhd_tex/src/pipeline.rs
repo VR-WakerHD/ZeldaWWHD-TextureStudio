@@ -27,7 +27,7 @@ use crate::upscale::{self, BackendChoice, Tools};
 
 pub const THUMB: u32 = 96;
 
-fn info_of(t: &TextureRecord) -> TextureInfo {
+pub(crate) fn info_of(t: &TextureRecord) -> TextureInfo {
     TextureInfo {
         id: t.id.clone(),
         kind: t.kind,
@@ -74,7 +74,7 @@ pub fn apply_display_map(rgba: &mut [u8], map: [u8; 4]) {
 }
 
 /// Read every needed leaf once per disc file and hand it to `f`.
-fn for_each_leaf<F>(inv: &Inventory, records: &[usize], progress: &Progress, f: F) -> Result<()>
+pub(crate) fn for_each_leaf<F>(inv: &Inventory, records: &[usize], progress: &Progress, f: F) -> Result<()>
 where
     F: Fn(&[u8], &[usize]) + Sync,
 {
@@ -458,6 +458,8 @@ fn recover(
                 format!("consistency ({q:.1} dB)")
             }
             Err(Error::Cancelled) => return Err(Error::Cancelled),
+            // A conventional filter resizes in one step: there is no lower scale to step down to.
+            Err(e) if !backend.is_ai() => return Err(e),
             Err(e) => format!("({e})"),
         };
         // Step down: same model, half the scale, down to x2; then Lanczos-3 at the planned scale.
@@ -530,7 +532,7 @@ pub struct ExportReport {
     pub guest_growth_bytes: u64,
 }
 
-fn mip_mode(class: Class, format: u32, rgba: &[u8]) -> MipMode {
+pub(crate) fn mip_mode(class: Class, format: u32, rgba: &[u8]) -> MipMode {
     let c = gx2::codec(format).ok();
     match class {
         // Decoded SNORM data is unsigned-mapped, see `run_with_recovery`.
@@ -646,6 +648,13 @@ fn load_encoded(path: &Path, t: &TextureRecord) -> Option<(bfres::TextureReplace
 /// detailed art usually lands at 32–40 dB; much lower means a broken encode.
 pub const MIN_PSNR: f32 = 24.0;
 
+/// The pool that encodes and writes textures. Large archives hold many 4K textures: half the cores (2 to 12) bound
+/// the memory in flight.
+pub(crate) fn worker_pool() -> Result<rayon::ThreadPool> {
+    let threads = std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(4).clamp(2, 12);
+    rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::Format(e.to_string()))
+}
+
 /// Stage 3: rebuild every affected disc file and write content packages.
 pub fn export(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progress: &Progress) -> Result<ExportReport> {
     let plans = policy::plan_all(inv, s, d);
@@ -683,9 +692,7 @@ pub fn export(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progres
     let file_results: Mutex<Vec<(String, u64, u64, u64)>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    // Large archives hold many 4K textures; limit concurrency to bound memory.
-    let threads = std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(4).clamp(2, 12);
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().map_err(|e| Error::Format(e.to_string()))?;
+    let pool = worker_pool()?;
     pool.install(|| {
         by_file.par_iter().for_each(|(file, idx)| {
             if progress.cancelled() {
@@ -1052,6 +1059,21 @@ mod tests {
         let r = go(&stub, &[job(4), job(8)]);
         assert_eq!((r[0].achieved, r[1].achieved), (4, 4));
         assert_eq!((r[0].steps.len(), r[1].steps.len()), (0, 1));
+    }
+
+    /// A conventional filter resizes in one step: when it fails there is no lower scale to try and no
+    /// other filter to fall back on; the error is the result.
+    #[test]
+    fn a_failing_filter_does_not_step_down() {
+        let asked = RefCell::new(Vec::new());
+        let run = |_: &BackendChoice, _: u32, js: &[upscale::Job]| -> Result<Vec<upscale::Output>> {
+            asked.borrow_mut().push(js[0].scale);
+            Err(Error::Format("filter failed".into()))
+        };
+        let backend = BackendChoice::Filter(Filter::Mitchell);
+        let r = recover(&backend, true, 0, &run, &|_, o| o, &[job(4)], &|_| {});
+        assert!(matches!(r, Err(Error::Format(ref m)) if m == "filter failed"));
+        assert_eq!(*asked.borrow(), [4, 4, 4], "batch, tile 128, one by one; no x2 and no Lanczos");
     }
 
     #[test]

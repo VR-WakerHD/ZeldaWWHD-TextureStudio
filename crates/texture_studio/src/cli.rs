@@ -7,6 +7,7 @@ use wwhd_tex::jobs::Progress;
 use wwhd_tex::pipeline;
 use wwhd_tex::policy::{self, Decisions};
 use wwhd_tex::project::{Project, ScanScope, Settings};
+use wwhd_tex::runtime_pack::{self, is_runtime_id};
 use wwhd_tex::resample::{self, Edge, Filter};
 use wwhd_tex::upscale::{self, BackendChoice};
 use wwhd_tex::Result;
@@ -18,10 +19,12 @@ Without arguments the GUI starts. Commands:
   scan     --project DIR --disc DIR [--scope content|all|PATH,PATH]
   extract  --project DIR
   upscale  --project DIR [--only TEXT,TEXT]
-  export   --project DIR [--only TEXT,TEXT]
-  run      --project DIR [--disc DIR] [--only TEXT,TEXT]   scan (if needed), extract, upscale, export
+  export   --project DIR [--only TEXT,TEXT]                  rebuilt-archive content packages
+  export-runtime --project DIR [--only TEXT,TEXT] [--debug-tint]   runtime texture packs (index.json + DDS)
+  run     --project DIR [--disc DIR] [--only TEXT,TEXT]   scan (if needed), extract, upscale, export
   compare  --project DIR --names TEXT,TEXT [--backends all|KEY,KEY] [--crop N]
-  install  --project DIR --mods-root DIR [--no-enable]      copy packages into a ModManager folder
+  install  --project DIR --mods-root DIR [--kind archives|runtime] [--no-enable]
+                                                            copy packages into a ModManager folder
   stats    --project DIR
 ";
 
@@ -130,6 +133,11 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
             let r = pipeline::export(&project, &s, &inv, &d, &prog)?;
             print_report(&r);
         }
+        "export-runtime" => {
+            let inv = load_inventory(&project)?;
+            let r = runtime_pack::export_runtime(&project, &s, &inv, &d, &prog)?;
+            print_runtime_report(&r);
+        }
         "run" => {
             let mut inv = match Inventory::load(&project.inventory_path()) {
                 Ok(i) if i.root == s.disc_root.to_string_lossy() => i,
@@ -150,8 +158,12 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
         "compare" => compare(&project, &s, a, &prog)?,
         "install" => {
             let root = a.get("--mods-root").ok_or_else(|| wwhd_tex::Error::Format("--mods-root is required".into()))?;
-            let ids = install(&project, Path::new(&root), !a.flag("--no-enable"))?;
-            println!("installed: {ids:?}");
+            let kind = InstallKind::parse(a.get("--kind").as_deref().unwrap_or("archives"))?;
+            let done = install(&project, Path::new(&root), !a.flag("--no-enable"), kind)?;
+            println!("installed: {:?}", done.ids);
+            for w in &done.warnings {
+                println!("warning: {w}");
+            }
         }
         "stats" => stats(&project, &s, &d)?,
         _ => {
@@ -181,6 +193,37 @@ fn print_report(r: &pipeline::ExportReport) {
     }
     if r.file_errors.len() > 30 {
         println!("  ... {} more problems in reports/export_report.json", r.file_errors.len() - 30);
+    }
+}
+
+fn print_runtime_report(r: &runtime_pack::RuntimeReport) {
+    println!(
+        "Runtime pack: {} entries in {} packages, {} MiB on disc, ~{} MiB texture memory if all resident",
+        r.entries,
+        r.packages.len(),
+        r.bytes >> 20,
+        r.vram_estimate_bytes >> 20
+    );
+    for (id, size, n) in &r.packages {
+        println!("  package {id}: {n} entries, {} MiB", size >> 20);
+    }
+    println!("  {} kept at native resolution by the policy, {} shared a key with an earlier texture", r.native, r.shared);
+    let mut by_reason: std::collections::BTreeMap<&str, usize> = Default::default();
+    for sk in &r.skipped {
+        *by_reason.entry(sk.reason.as_str()).or_default() += 1;
+    }
+    println!("  {} skipped", r.skipped.len());
+    for (reason, n) in by_reason {
+        println!("    {n} x {reason}");
+    }
+    for w in &r.warnings {
+        println!("  warning: {w}");
+    }
+    for e in r.errors.iter().take(30) {
+        println!("  ! {e}");
+    }
+    if r.errors.len() > 30 {
+        println!("  ... {} more problems in reports/runtime_export_report.json", r.errors.len() - 30);
     }
 }
 
@@ -286,27 +329,71 @@ fn blit(dst: &mut [u8], dw: u32, x: u32, y: u32, w: u32, h: u32, src: &[u8]) {
     }
 }
 
-/// Copy this project's packages into `<mods_root>/Mods/<id>` and, when
-/// `enable`, switch them on in the active profile of `<mods_root>/profiles.json`.
-pub fn install(p: &Project, mods_root: &Path, enable: bool) -> Result<Vec<String>> {
+/// Which kind of package `install` handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallKind {
+    /// Rebuilt-archive `content` packages (`output/packages`).
+    Archives,
+    /// Runtime `textures` packages (`output/runtime`).
+    Runtime,
+}
+
+impl InstallKind {
+    pub fn parse(s: &str) -> Result<InstallKind> {
+        match s {
+            "archives" => Ok(InstallKind::Archives),
+            "runtime" => Ok(InstallKind::Runtime),
+            other => Err(wwhd_tex::Error::Format(format!("--kind must be archives or runtime, not {other}"))),
+        }
+    }
+    /// Whether `id` is a package of this kind made by this tool (runtime ids also start with the archives' prefix).
+    fn owns(self, id: &str) -> bool {
+        id.starts_with(pipeline::PACKAGE_PREFIX) && (is_runtime_id(id) == (self == InstallKind::Runtime))
+    }
+    fn other(self) -> InstallKind {
+        if self == InstallKind::Runtime { InstallKind::Archives } else { InstallKind::Runtime }
+    }
+    fn source(self, p: &Project) -> PathBuf {
+        if self == InstallKind::Runtime { p.runtime_dir() } else { p.packages_dir() }
+    }
+}
+
+/// What `install` did.
+#[derive(Debug, Default)]
+pub struct Installed {
+    pub ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Copy this project's packages of `kind` into `<mods_root>/Mods/<id>` and, when `enable`, switch them on in the
+/// active profile of `<mods_root>/profiles.json`. Packages of the other kind are left as they are; when `enable`
+/// finds both kinds switched on it warns, because the two replace the same textures in different ways.
+pub fn install(p: &Project, mods_root: &Path, enable: bool, kind: InstallKind) -> Result<Installed> {
+    let src = kind.source(p);
+    let none = |why: String| wwhd_tex::Error::Format(format!("no packages in {} ({why}); export first", src.display()));
     let mut ids = Vec::new();
+    for e in std::fs::read_dir(&src).map_err(|e| none(e.to_string()))?.flatten() {
+        let id = e.file_name().to_string_lossy().into_owned();
+        if kind.owns(&id) && e.path().is_dir() {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    if ids.is_empty() {
+        return Err(none("empty".into()));
+    }
     let mods = mods_root.join("Mods");
     std::fs::create_dir_all(&mods)?;
-    // Remove older installs of this tool's packages first (they may be split differently).
+    // Remove older installs of this tool's packages of this kind first (they may be split differently).
     for e in std::fs::read_dir(&mods)?.flatten() {
-        if e.file_name().to_string_lossy().starts_with(pipeline::PACKAGE_PREFIX) {
+        if kind.owns(&e.file_name().to_string_lossy()) {
             std::fs::remove_dir_all(e.path())?;
         }
     }
-    for e in std::fs::read_dir(p.packages_dir())?.flatten() {
-        let id = e.file_name().to_string_lossy().into_owned();
-        if !id.starts_with(pipeline::PACKAGE_PREFIX) {
-            continue;
-        }
-        copy_dir(&e.path(), &mods.join(&id))?;
-        ids.push(id);
+    for id in &ids {
+        copy_dir(&src.join(id), &mods.join(id))?;
     }
-    ids.sort();
+    let mut warnings = Vec::new();
     if enable {
         let path = mods_root.join("profiles.json");
         let mut db: serde_json::Value = std::fs::read(&path)
@@ -319,13 +406,20 @@ pub fn install(p: &Project, mods_root: &Path, enable: bool) -> Result<Vec<String
             profile["enabled"] = serde_json::json!({});
         }
         let enabled = profile["enabled"].as_object_mut().unwrap();
-        enabled.retain(|k, _| !k.starts_with(pipeline::PACKAGE_PREFIX) || ids.contains(k));
+        enabled.retain(|k, _| !kind.owns(k) || ids.contains(k));
         for id in &ids {
             enabled.insert(id.clone(), serde_json::Value::Bool(true));
         }
+        let others: Vec<&str> = enabled.iter().filter(|(k, v)| kind.other().owns(k) && v.as_bool() == Some(true)).map(|(k, _)| k.as_str()).collect();
+        if !others.is_empty() {
+            let (what, list) = (if kind == InstallKind::Runtime { "rebuilt-archive packages are" } else { "runtime texture packs are" }, others.join(", "));
+            warnings.push(format!(
+                "{what} enabled too ({list}); the textures they replace no longer match the keys of the other kind, so one of the two does nothing: harmless, but wasted memory. Switch one kind off."
+            ));
+        }
         wwhd_tex::project::write_atomic(&path, &serde_json::to_vec_pretty(&db)?)?;
     }
-    Ok(ids)
+    Ok(Installed { ids, warnings })
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
@@ -340,4 +434,85 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project with one package of each kind and a ModManager folder whose active profile has `enabled`.
+    fn rig(name: &str, enabled: serde_json::Value) -> (PathBuf, Project, PathBuf) {
+        let root = std::env::temp_dir().join(format!("wwhd-install-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let p = Project::open(root.join("project")).unwrap();
+        let archive = p.packages_dir().join("wwhd-texture-studio-1");
+        let runtime = p.runtime_dir().join("wwhd-texture-studio-tex-1");
+        std::fs::create_dir_all(archive.join("content")).unwrap();
+        std::fs::write(archive.join("manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(runtime.join("textures/ab")).unwrap();
+        std::fs::write(runtime.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(runtime.join("textures/index.json"), b"{}").unwrap();
+        std::fs::write(runtime.join("textures/ab/abcd.dds"), b"dds").unwrap();
+        let mods = root.join("mods");
+        std::fs::create_dir_all(&mods).unwrap();
+        let db = serde_json::json!({"format_version": 1, "active": "Default", "profiles": {"Default": {"enabled": enabled}}});
+        std::fs::write(mods.join("profiles.json"), serde_json::to_vec(&db).unwrap()).unwrap();
+        (root, p, mods)
+    }
+
+    fn enabled(mods: &Path) -> serde_json::Value {
+        let db: serde_json::Value = serde_json::from_slice(&std::fs::read(mods.join("profiles.json")).unwrap()).unwrap();
+        db["profiles"]["Default"]["enabled"].clone()
+    }
+
+    #[test]
+    fn runtime_install_copies_and_enables_texture_packs_and_leaves_archive_packs_alone() {
+        let (root, p, mods) = rig("runtime", serde_json::json!({"other-mod": true}));
+        std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-1")).unwrap();
+        std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-tex-9")).unwrap(); // stale: removed
+        let done = install(&p, &mods, true, InstallKind::Runtime).unwrap();
+        assert_eq!(done.ids, ["wwhd-texture-studio-tex-1"]);
+        assert!(done.warnings.is_empty(), "{:?}", done.warnings);
+        assert_eq!(std::fs::read(mods.join("Mods/wwhd-texture-studio-tex-1/textures/ab/abcd.dds")).unwrap(), b"dds");
+        assert!(mods.join("Mods/wwhd-texture-studio-1").exists(), "the archive install is not this kind's");
+        assert!(!mods.join("Mods/wwhd-texture-studio-tex-9").exists());
+        assert_eq!(enabled(&mods), serde_json::json!({"other-mod": true, "wwhd-texture-studio-tex-1": true}));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_install_warns_when_archive_packs_are_enabled() {
+        let (root, p, mods) = rig("warn-runtime", serde_json::json!({"wwhd-texture-studio-1": true}));
+        let done = install(&p, &mods, true, InstallKind::Runtime).unwrap();
+        assert_eq!(done.warnings.len(), 1);
+        assert!(done.warnings[0].contains("rebuilt-archive") && done.warnings[0].contains("wwhd-texture-studio-1"), "{:?}", done.warnings);
+        // an archive pack that is installed but switched off is no conflict
+        let (root2, p2, mods2) = rig("no-warn", serde_json::json!({"wwhd-texture-studio-1": false}));
+        assert!(install(&p2, &mods2, true, InstallKind::Runtime).unwrap().warnings.is_empty());
+        let _ = (std::fs::remove_dir_all(root), std::fs::remove_dir_all(root2));
+    }
+
+    #[test]
+    fn archive_install_warns_when_runtime_packs_are_enabled_and_keeps_them() {
+        let (root, p, mods) = rig("warn-archives", serde_json::json!({"wwhd-texture-studio-tex-1": true}));
+        std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-tex-1")).unwrap();
+        let done = install(&p, &mods, true, InstallKind::Archives).unwrap();
+        assert_eq!(done.ids, ["wwhd-texture-studio-1"]);
+        assert_eq!(done.warnings.len(), 1);
+        assert!(done.warnings[0].contains("runtime texture packs"), "{:?}", done.warnings);
+        assert!(mods.join("Mods/wwhd-texture-studio-tex-1").exists(), "the runtime install is not this kind's");
+        assert_eq!(enabled(&mods), serde_json::json!({"wwhd-texture-studio-tex-1": true, "wwhd-texture-studio-1": true}));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installing_with_nothing_exported_is_an_error_and_removes_nothing() {
+        let (root, p, mods) = rig("empty", serde_json::json!({}));
+        std::fs::remove_dir_all(p.runtime_dir()).unwrap();
+        std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-tex-1")).unwrap();
+        assert!(install(&p, &mods, true, InstallKind::Runtime).is_err());
+        assert!(mods.join("Mods/wwhd-texture-studio-tex-1").exists());
+        assert!(InstallKind::parse("runtime").is_ok() && InstallKind::parse("both").is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
