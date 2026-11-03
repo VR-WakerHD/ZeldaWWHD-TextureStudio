@@ -227,9 +227,12 @@ impl App {
             Ok(p) => {
                 self.settings = p.load_settings();
                 if self.settings.tools_dir.is_relative() {
-                    // Resolve relative to the executable's repository layout or the working dir.
-                    let exe_rel = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("../../tools/upscalers")));
-                    if let Some(c) = exe_rel.filter(|c| c.exists()) {
+                    // Resolve next to the executable (the release zip), in its repository layout, or the working dir.
+                    let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf()));
+                    let exe_rel = exe_dir.and_then(|d| {
+                        [d.join(&self.settings.tools_dir), d.join("../..").join(&self.settings.tools_dir)].into_iter().find(|c| c.exists())
+                    });
+                    if let Some(c) = exe_rel {
                         self.settings.tools_dir = c.canonicalize().unwrap_or(c);
                     }
                 }

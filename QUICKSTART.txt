@@ -1,0 +1,39 @@
+ZeldaWWHD Texture Studio - Quick start (x4 textures, then play)
+================================================================
+
+You need
+  - Your Wind Waker HD disc dump (the folder with code\, content\, meta\)
+  - About 25 GB free disk space for an x4 project (upscales + the runtime pack, ~17 GB)
+  - The app: texture_studio.exe (in the zip's folder; in the source tree,
+    target\release\texture_studio.exe). It needs the Microsoft Visual C++
+    Redistributable (x64), which most PCs with games already have:
+    https://aka.ms/vs/17/release/vc_redist.x64.exe
+  - Keep the tools\ folder next to texture_studio.exe: it holds the upscalers
+    (Real-ESRGAN, waifu2x). "Install Upscaling Models" adds the others.
+
+1. Start texture_studio.exe.
+
+2. Top bar: choose a PROJECT folder (empty folder on a drive with space)
+   and the GAME DISC folder.
+
+3. Settings tab (first time only): press "Install Upscaling Models" and wait
+   until it finishes (Queue & log shows progress). Leave the rest as it is:
+   the defaults are already x4 with max side 4096.
+
+4. Press "Process everything" (top bar). It scans, upscales and checks every
+   texture. This takes a long time; you can pause, and a stopped run resumes
+   where it left off.
+
+5. Export / install tab:
+     a. Press "Export runtime pack".
+     b. Press "Install runtime pack". It installs into the game's ModManager
+        folder, which the app finds for you (shown on the tab; change it in
+        Settings if it is wrong).
+   Use the runtime pack OR the rebuilt archives, not both. The runtime pack is
+   the sharper one (BC7); "Install rebuilt archives" is the lighter one (BC1).
+
+6. Start the game. In the Mods tab, check the "WWHD 4K Textures Runtime"
+   packages are switched on, then play. Switch them off in the Mods tab to
+   see the original textures again (takes effect after a restart).
+
+More detail: README.md and docs\user-guide.md.

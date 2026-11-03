@@ -200,6 +200,14 @@ pub const RUNTIME_PREFIX: &str = "wwhd-texture-studio-tex-";
 /// The largest a runtime package may grow.
 pub const PACKAGE_MAX_BYTES: u64 = 4 << 30;
 
+/// The largest index.json a runtime package may have: the recomp reads it with its JSON reader, which took at most
+/// 1 MiB before 2026-11-03 (a larger index made the whole package fail to load). Packages are split to stay under it,
+/// so they load in every build.
+pub const INDEX_MAX_BYTES: u64 = 1 << 20;
+
+/// Room kept in each index for its header (format_version, generator) and the brackets around the entries.
+const INDEX_HEADER_BYTES: u64 = 4 << 10;
+
 /// Above this estimate of resident texture memory the export warns.
 pub const VRAM_WARN_BYTES: u64 = 8 << 30;
 
@@ -321,11 +329,40 @@ fn archives_by_content_key(inv: &Inventory, s: &Settings) -> HashMap<String, BTr
 /// Stage "Runtime pack": writes `textures` packages (index.json + DDS per key) from the upscales the pipeline made,
 /// with the rules of the archive export for review state and `debug_tint` but none of its guest-heap limits.
 pub fn export_runtime(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progress: &Progress) -> Result<RuntimeReport> {
-    export_runtime_with(p, s, inv, d, progress, PACKAGE_MAX_BYTES)
+    export_runtime_with(p, s, inv, d, progress, PACKAGE_MAX_BYTES, INDEX_MAX_BYTES)
+}
+
+/// One index.json entry for `st`.
+fn index_entry(st: &Staged, archives: &BTreeMap<Key, BTreeSet<String>>) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "format": st.key.0, "width": st.key.1, "height": st.key.2, "hash": format!("{:016x}", st.key.3),
+        "scale": st.scale, "file": dds_file(&st.key), "dxgi": st.dxgi, "name": st.name,
+    });
+    // Optional: lets the recomp load the replacement when the game opens one of these files.
+    if let Some(a) = archives.get(&st.key).filter(|a| !a.is_empty()) {
+        entry["archives"] = serde_json::json!(a);
+    }
+    entry
+}
+
+/// Bytes `entry` takes in an index written by `to_vec_pretty`: its own pretty text indented two levels (4 spaces a
+/// line) plus the comma and line break after it.
+fn index_entry_bytes(entry: &serde_json::Value) -> u64 {
+    let text = serde_json::to_vec_pretty(entry).unwrap_or_default();
+    let lines = text.iter().filter(|&&b| b == b'\n').count() as u64 + 1;
+    text.len() as u64 + 4 * lines + 2
 }
 
 /// `export_runtime` with the package size limit as a parameter, so tests can split small exports.
-fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progress: &Progress, package_max: u64) -> Result<RuntimeReport> {
+fn export_runtime_with(
+    p: &Project,
+    s: &Settings,
+    inv: &Inventory,
+    d: &Decisions,
+    progress: &Progress,
+    package_max: u64,
+    index_max: u64,
+) -> Result<RuntimeReport> {
     let plans = policy::plan_all_runtime(inv, s, d);
     let mut report = RuntimeReport::default();
 
@@ -437,20 +474,23 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
     report.errors = errors.into_inner().unwrap();
     report.errors.sort();
 
-    // Split into packages within the size limit (first-fit decreasing).
+    // Split into packages within the size limit and the index limit (first-fit decreasing).
     staged.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.key.cmp(&b.key)));
-    let mut bins: Vec<(u64, Vec<Staged>)> = Vec::new();
+    let index_room = index_max.saturating_sub(INDEX_HEADER_BYTES);
+    let mut bins: Vec<(u64, u64, Vec<Staged>)> = Vec::new();
     for st in staged {
         if st.bytes > package_max {
             report.errors.push(format!("{}: {} bytes exceed the package limit of {package_max} bytes; kept original", st.name, st.bytes));
             continue;
         }
-        match bins.iter_mut().find(|(size, _)| size + st.bytes <= package_max) {
+        let ib = index_entry_bytes(&index_entry(&st, &archives));
+        match bins.iter_mut().find(|(size, index, _)| size + st.bytes <= package_max && index + ib <= index_room) {
             Some(b) => {
                 b.0 += st.bytes;
-                b.1.push(st);
+                b.1 += ib;
+                b.2.push(st);
             }
-            None => bins.push((st.bytes, vec![st])),
+            None => bins.push((st.bytes, ib, vec![st])),
         }
     }
     if bins.is_empty() {
@@ -464,26 +504,16 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
         }
     }
     let (generator, count) = (format!("ZeldaWWHD Texture Studio {}", env!("CARGO_PKG_VERSION")), bins.len());
-    for (k, (size, list)) in bins.iter_mut().enumerate() {
+    for (k, (size, _, list)) in bins.iter_mut().enumerate() {
         let id = format!("{RUNTIME_PREFIX}{}", k + 1);
         let dir = root.join(&id);
         let mut entries = Vec::new();
         list.sort_by_key(|st| st.key.3);
         for st in list.iter() {
-            let hash = format!("{:016x}", st.key.3);
-            let file = dds_file(&st.key);
-            let dst = dir.join("textures").join(&file);
+            let dst = dir.join("textures").join(dds_file(&st.key));
             std::fs::create_dir_all(dst.parent().unwrap())?;
             std::fs::rename(&st.path, &dst)?;
-            let mut entry = serde_json::json!({
-                "format": st.key.0, "width": st.key.1, "height": st.key.2, "hash": hash,
-                "scale": st.scale, "file": file, "dxgi": st.dxgi, "name": st.name,
-            });
-            // Optional: lets the recomp load the replacement when the game opens one of these files.
-            if let Some(a) = archives.get(&st.key).filter(|a| !a.is_empty()) {
-                entry["archives"] = serde_json::json!(a);
-            }
-            entries.push(entry);
+            entries.push(index_entry(st, &archives));
         }
         write_atomic(
             &dir.join("textures/index.json"),
@@ -977,7 +1007,7 @@ mod tests {
         rig.add("a.bflim", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &pattern(128, 1), true);
         rig.add("ui.bflim", "dd", Class::Ui, 16, 0x09, &pattern(1024, 7), true);
         // BC7 32x32 = 1024 + 148 bytes, RGBA8 32x32 = 4096 + 148: together they exceed 4300
-        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 4300).unwrap();
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 4300, INDEX_MAX_BYTES).unwrap();
         assert_eq!((r.entries, r.packages.len()), (2, 2), "{r:?}");
         let mut hashes = Vec::new();
         for (k, (id, size, n)) in r.packages.iter().enumerate() {
@@ -996,16 +1026,39 @@ mod tests {
         hashes.dedup();
         assert_eq!(hashes.len(), 2, "no key in both packages");
         // exporting again with a roomier limit replaces the old packages instead of leaving the second behind
-        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1 << 20).unwrap();
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1 << 20, INDEX_MAX_BYTES).unwrap();
         assert_eq!(r.packages.len(), 1);
         assert!(!rig.runtime_dir().join("wwhd-texture-studio-tex-2").exists());
+    }
+
+    #[test]
+    fn packages_split_to_keep_index_json_under_the_index_limit() {
+        let mut rig = Rig::new("indexsplit");
+        rig.add("a.bflim", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &pattern(128, 1), true);
+        rig.add("ui.bflim", "dd", Class::Ui, 16, 0x09, &pattern(1024, 7), true);
+        // one index: its size is the header plus the estimates of its entries
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1 << 20, INDEX_MAX_BYTES).unwrap();
+        assert_eq!(r.packages.len(), 1);
+        let path = rig.runtime_dir().join(&r.packages[0].0).join("textures/index.json");
+        let index: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let estimate: u64 = index["entries"].as_array().unwrap().iter().map(index_entry_bytes).sum();
+        let written = std::fs::metadata(&path).unwrap().len();
+        assert!(written >= estimate - 2 && written <= estimate + INDEX_HEADER_BYTES, "{written} vs {estimate}");
+        // room for the header and less than both entries: one entry a package, each index under the limit
+        let index_max = INDEX_HEADER_BYTES + estimate - 1;
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1 << 20, index_max).unwrap();
+        assert_eq!((r.entries, r.packages.len()), (2, 2), "{r:?}");
+        for (id, _, n) in &r.packages {
+            assert_eq!(*n, 1);
+            assert!(std::fs::metadata(rig.runtime_dir().join(id).join("textures/index.json")).unwrap().len() <= index_max);
+        }
     }
 
     #[test]
     fn a_texture_bigger_than_the_package_limit_is_an_error_not_a_package() {
         let mut rig = Rig::new("toobig");
         rig.add("ui.bflim", "dd", Class::Ui, 16, 0x09, &pattern(1024, 7), true);
-        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1000).unwrap();
+        let r = export_runtime_with(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default(), 1000, INDEX_MAX_BYTES).unwrap();
         assert_eq!((r.entries, r.packages.len()), (0, 0));
         assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
         assert!(r.errors[0].contains("package limit"), "{:?}", r.errors);
