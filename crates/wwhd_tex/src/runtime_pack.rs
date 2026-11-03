@@ -3,7 +3,7 @@
 //! A texture is identified by (GX2 format, width, height, XXH3-64 of its level-0 guest bytes). The recomp hashes
 //! the same bytes at run time, so `level0_bytes` must slice exactly what the game uploads.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -302,6 +302,22 @@ fn entry_name(t: &TextureRecord) -> String {
     parts.join("/")
 }
 
+/// Content key -> the top-level disc files (game paths below `content/`, forward slashes) that hold a texture with
+/// it. A texture inside a pack or archive belongs to the file the game opens, which is `location.file`; the nested
+/// names in `location.inner` are not files of their own. The recomp prefetches a key when the game opens one of these.
+fn archives_by_content_key(inv: &Inventory, s: &Settings) -> HashMap<String, BTreeSet<String>> {
+    let mut map: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for t in &inv.textures {
+        if !s.file_selected(&t.id.location.file) {
+            continue;
+        }
+        if let Some(path) = pipeline::game_path(&inv.root, &t.id.location.file) {
+            map.entry(t.key.clone()).or_default().insert(path.replace('\\', "/"));
+        }
+    }
+    map
+}
+
 /// Stage "Runtime pack": writes `textures` packages (index.json + DDS per key) from the upscales the pipeline made,
 /// with the rules of the archive export for review state and `debug_tint` but none of its guest-heap limits.
 pub fn export_runtime(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progress: &Progress) -> Result<RuntimeReport> {
@@ -363,6 +379,8 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
         return Err(Error::Cancelled);
     }
     let hashes = hashes.into_inner().unwrap();
+    let by_content = archives_by_content_key(inv, s);
+    let mut archives: BTreeMap<Key, BTreeSet<String>> = BTreeMap::new();
     let mut unique: BTreeMap<Key, &Candidate> = BTreeMap::new();
     for c in &cands {
         let t = &inv.textures[c.record];
@@ -370,7 +388,11 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
             report.skipped.push(Skipped { name: entry_name(t), reason: "could not be read from the disc".into() });
             continue;
         };
-        match unique.entry((t.surface.format, t.surface.width, t.surface.height, h)) {
+        let key = (t.surface.format, t.surface.width, t.surface.height, h);
+        if let Some(files) = by_content.get(&t.key) {
+            archives.entry(key).or_default().extend(files.iter().cloned());
+        }
+        match unique.entry(key) {
             std::collections::btree_map::Entry::Vacant(v) => {
                 v.insert(c);
             }
@@ -453,10 +475,15 @@ fn export_runtime_with(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions
             let dst = dir.join("textures").join(&file);
             std::fs::create_dir_all(dst.parent().unwrap())?;
             std::fs::rename(&st.path, &dst)?;
-            entries.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "format": st.key.0, "width": st.key.1, "height": st.key.2, "hash": hash,
                 "scale": st.scale, "file": file, "dxgi": st.dxgi, "name": st.name,
-            }));
+            });
+            // Optional: lets the recomp load the replacement when the game opens one of these files.
+            if let Some(a) = archives.get(&st.key).filter(|a| !a.is_empty()) {
+                entry["archives"] = serde_json::json!(a);
+            }
+            entries.push(entry);
         }
         write_atomic(
             &dir.join("textures/index.json"),
@@ -755,10 +782,10 @@ mod tests {
         fn new(name: &str) -> Rig {
             let root = std::env::temp_dir().join(format!("wwhd-runtime-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("disc")).unwrap();
+            std::fs::create_dir_all(root.join("content")).unwrap();
             let p = Project::open(root.join("project")).unwrap();
             let s = Settings { scale: 2, default_backend: BackendChoice::Filter(Filter::Lanczos3), backends: vec![], ..Settings::default() };
-            let inv = Inventory { root: root.join("disc").to_string_lossy().into_owned(), ..Default::default() };
+            let inv = Inventory { root: root.join("content").to_string_lossy().into_owned(), ..Default::default() };
             Rig { root, p, s, inv }
         }
         /// Writes `<file>` to the disc, adds its record under content key `key` and (when `upscaled`) its x2 PNG.
@@ -768,7 +795,9 @@ mod tests {
         #[allow(clippy::too_many_arguments)]
         fn add_shaped(&mut self, file: &str, key: &str, class: Class, (w, h): (u16, u16), flim_format: u8, image: &[u8], upscaled: bool) {
             let leaf = bflim(w, h, flim_format, image);
-            std::fs::write(self.root.join("disc").join(file), &leaf).unwrap();
+            let path = self.root.join("content").join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &leaf).unwrap();
             let f = crate::bflim::Bflim::parse(&leaf).unwrap();
             let key = key.repeat(8);
             self.inv.textures.push(TextureRecord {
@@ -872,6 +901,53 @@ mod tests {
         wide.max_dim = 8192;
         let w = export_runtime(&rig.p, &wide, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
         assert!(w.warnings.iter().any(|w| w.contains("max side 4096 for VR")), "{:?}", w.warnings);
+    }
+
+    #[test]
+    fn index_entries_list_every_archive_the_key_comes_from_sorted_and_deduplicated() {
+        let mut rig = Rig::new("archives");
+        let bc1 = pattern(128, 1);
+        rig.add("Common/Stage/sea_Room13.szs", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &bc1, true);
+        rig.add("Common/Stage/A_Room1.szs", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &bc1, true);
+        // a second record of the first archive and a different content key with the same level-0 bytes
+        rig.add("Common/Stage/sea_Room13.szs", "aa", Class::EnvironmentAlbedo, 16, 0x0C, &bc1, true);
+        rig.add("Common/Stage/B_Room2.szs", "cc", Class::EnvironmentAlbedo, 16, 0x0C, &bc1, true);
+        export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        let index = index_of(&rig.runtime_dir().join("wwhd-texture-studio-tex-1"));
+        let entries = index["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["archives"],
+            serde_json::json!(["Common/Stage/A_Room1.szs", "Common/Stage/B_Room2.szs", "Common/Stage/sea_Room13.szs"])
+        );
+    }
+
+    #[test]
+    fn a_texture_inside_a_pack_lists_the_pack_and_content_prefixes_are_stripped() {
+        let rec = |file: &str, inner: &[&str], key: &str| TextureRecord {
+            id: TextureId { location: AssetLocation { file: file.into(), inner: inner.iter().map(|s| s.to_string()).collect() }, index: 0, name: "t".into() },
+            kind: LeafKind::Bflim,
+            surface: Default::default(),
+            comp_sel: [0, 1, 2, 3],
+            data_hash: key.into(),
+            key: key.into(),
+            gate_ok: true,
+            gate_detail: String::new(),
+            decodable: true,
+            classification: Classification { class: Class::Ui, confidence: 1.0, reason: String::new(), manual: false },
+        };
+        let inv = Inventory {
+            root: "D:/game".into(),
+            textures: vec![
+                rec("content/Common/Pack/szs_permanent1.pack", &["sea_Room13.szs", "x.bflim"], "k1"),
+                rec("content/Common/Stage/sea_Room13.szs", &[], "k1"),
+                rec("Other/not_under_content.szs", &[], "k1"),
+            ],
+            ..Default::default()
+        };
+        let map = archives_by_content_key(&inv, &Settings::default());
+        let got: Vec<&str> = map["k1"].iter().map(|s| s.as_str()).collect();
+        assert_eq!(got, ["Common/Pack/szs_permanent1.pack", "Common/Stage/sea_Room13.szs"]);
     }
 
     #[test]

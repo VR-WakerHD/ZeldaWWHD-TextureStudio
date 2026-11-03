@@ -83,7 +83,9 @@ its own rebuilt copy.
    lettering classes); anything else, and multi-slice or non-2D textures, get no entry and keep the original. Each
    DDS has `original mips + log2(scale)` levels. Packages are split at 4 GiB; textures not upscaled yet are
    skipped and listed in the report. The estimate of texture memory warns above 8 GiB; the game keeps only what
-   its budget allows resident.
+   its budget allows resident. Each entry also lists, in an optional `archives` field, the game files (paths below
+   `content/`; a texture inside a `.pack` lists the pack) it comes from, so the recomp can load a replacement when
+   the game opens one of them instead of when it first draws it.
 
 ## The runtime pack in the game
 
