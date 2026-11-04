@@ -26,6 +26,7 @@ use crate::images::ImageCache;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
+    Quickstart,
     Dashboard,
     Assets,
     Compare,
@@ -744,6 +745,7 @@ impl eframe::App for App {
         egui::Panel::left("nav").resizable(false).exact_size(130.0).show(root, |ui| {
             ui.add_space(6.0);
             for (v, name) in [
+                (View::Quickstart, "Quickstart"),
                 (View::Dashboard, "Dashboard"),
                 (View::Assets, "Assets"),
                 (View::Compare, "Compare models"),
@@ -767,6 +769,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(root, |ui| match self.view {
+            View::Quickstart => quickstart(ui),
             View::Dashboard => self.dashboard(ui),
             View::Assets => self.assets(ui),
             View::Compare => self.compare(ui),
@@ -776,6 +779,13 @@ impl eframe::App for App {
             View::Diagnostics => self.diagnostics(ui),
         });
     }
+}
+
+/// The Quickstart tab: QUICKSTART.txt (the same file the release zip carries), as written.
+fn quickstart(ui: &mut egui::Ui) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.label(RichText::new(include_str!("../../../QUICKSTART.txt").replace('\r', "")).monospace());
+    });
 }
 
 impl App {
