@@ -234,7 +234,9 @@ impl App {
                         [d.join(&self.settings.tools_dir), d.join("../..").join(&self.settings.tools_dir)].into_iter().find(|c| c.exists())
                     });
                     if let Some(c) = exe_rel {
-                        self.settings.tools_dir = c.canonicalize().unwrap_or(c);
+                        // absolute, not canonicalize: on Windows that gives a \\?\ path, which the ncnn tools take as
+                        // relative and join to their own folder (the model files were not found)
+                        self.settings.tools_dir = std::path::absolute(&c).unwrap_or(c);
                     }
                 }
                 self.decisions = Decisions::load(&p.review_path(), &p.classes_path());
