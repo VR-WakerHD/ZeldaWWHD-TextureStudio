@@ -209,6 +209,46 @@ impl Tools {
     }
 }
 
+/// The Vulkan devices the ncnn tools see, as `(-g number, name)` in their order: the device lines an installed tool
+/// prints at start (`[0 NVIDIA GeForce RTX 4090]  queueC=...`), read from a run with an input that does not exist (it
+/// stops after listing them). Empty without an installed tool or a Vulkan device. Blocks for about a second.
+pub fn list_gpus(tools: &Tools) -> Vec<(i32, String)> {
+    let probes = [
+        BackendChoice::default(),
+        BackendChoice::Waifu2x { model: "models-cunet".into(), noise: 0 },
+        BackendChoice::RealCugan { model: "models-se".into(), noise: -1 },
+        BackendChoice::RealSr("models-DF2K".into()),
+    ];
+    let Some(exe) = probes.iter().find_map(|b| tools.exe(b)) else { return Vec::new() };
+    let missing = std::env::temp_dir().join(format!("wwhd-gpu-probe-{}-missing.png", std::process::id()));
+    let mut cmd = Command::new(&exe);
+    cmd.current_dir(exe.parent().unwrap_or(Path::new("."))).arg("-i").arg(&missing).arg("-o").arg(missing.with_extension("out.png"));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    match cmd.stdin(std::process::Stdio::null()).output() {
+        Ok(o) => parse_gpu_lines(&String::from_utf8_lossy(&o.stderr)),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The devices in an ncnn tool's start-up lines (`[<n> <name>]  <fields>`), each once, in order.
+fn parse_gpu_lines(text: &str) -> Vec<(i32, String)> {
+    let mut out: Vec<(i32, String)> = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix('[') else { continue };
+        let Some((inside, _)) = rest.split_once(']') else { continue };
+        let Some((n, name)) = inside.split_once(' ') else { continue };
+        let (Ok(n), name) = (n.parse::<i32>(), name.trim()) else { continue };
+        if !name.is_empty() && !out.iter().any(|(m, _)| *m == n) {
+            out.push((n, name.to_string()));
+        }
+    }
+    out
+}
+
 /// One image to upscale.
 pub struct Job {
     pub name: String,
@@ -446,6 +486,29 @@ pub fn upscale_normal_map(w: u32, h: u32, rgba: &[u8], scale: u32, two_channel: 
 
 #[cfg(test)]
 mod tests {
+    /// The installed tools' cards on this machine (`cargo test -p wwhd_tex list_gpus_here -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn list_gpus_here() {
+        let tools = Tools { dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/upscalers") };
+        let gpus = list_gpus(&tools);
+        println!("{gpus:?}");
+        assert!(!gpus.is_empty());
+    }
+
+    #[test]
+    fn gpu_names_come_from_the_tools_device_lines_in_their_order() {
+        let text = "[0 NVIDIA GeForce RTX 4090]  queueC=2[8]  queueG=0[16]  queueT=1[2]\n\
+                    [0 NVIDIA GeForce RTX 4090]  subgroup=32  basic=1\n\
+                    [1 AMD Radeon(TM) Graphics]  queueC=1[4]  queueG=0[8]\n\
+                    decode image C:/x/none.png failed\n";
+        assert_eq!(
+            parse_gpu_lines(text),
+            vec![(0, "NVIDIA GeForce RTX 4090".to_string()), (1, "AMD Radeon(TM) Graphics".to_string())]
+        );
+        assert!(parse_gpu_lines("Usage: realesrgan-ncnn-vulkan -i infile\n  -h  show this help\n").is_empty());
+    }
+
     #[test]
     fn gpu_automatic_passes_no_device_and_cpu_only_where_the_tool_has_one() {
         let esrgan = BackendChoice::default();

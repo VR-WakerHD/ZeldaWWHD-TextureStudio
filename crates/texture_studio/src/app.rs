@@ -94,6 +94,8 @@ enum Msg {
     Found(derived::ScanResult),
     /// Upscaling models installed: the tools folder changed.
     ToolsInstalled,
+    /// The graphics cards the upscalers see (`upscale::list_gpus`).
+    Gpus(Vec<(i32, String)>),
     Done(String),
     Failed(String),
 }
@@ -137,6 +139,8 @@ pub struct App {
     env_dirty: bool,
     /// Which supported AI upscalers are in the tools folder; re-read when `tools_dirty`.
     tools_status: Vec<tools_install::Status>,
+    /// The graphics cards the upscalers see, for Settings > GPU (`None` until the first look, which runs on a thread).
+    gpus: Option<Vec<(i32, String)>>,
     tools_dirty: bool,
     install_confirm: bool,
     /// An install waits for the user to agree to create the missing mods folder.
@@ -204,6 +208,7 @@ impl App {
             env_info: None,
             env_dirty: true,
             tools_status: Vec::new(),
+            gpus: None,
             tools_dirty: true,
             install_confirm: false,
             create_confirm: None,
@@ -551,6 +556,7 @@ impl App {
                     self.compare_dirty = true;
                 }
                 Msg::ToolsInstalled => self.tools_dirty = true,
+                Msg::Gpus(g) => self.gpus = Some(g),
                 Msg::Done(s) => {
                     self.status = s;
                     self.files_changed();
@@ -572,7 +578,7 @@ impl App {
         if let Some(c) = &mut self.images {
             c.pump(ctx);
         }
-        if self.busy() {
+        if self.busy() || self.gpus.is_none() {  // (also while the cards are detected: the menu shows them when done)
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
     }
@@ -674,6 +680,7 @@ impl eframe::App for App {
         if self.tools_dirty {
             self.tools_status = tools_install::status(&self.settings.tools_dir);
             self.tools_dirty = false;
+            self.detect_gpus();  // (the tools may have changed)
         }
 
         egui::Panel::top("top").show(root, |ui| {
@@ -791,6 +798,16 @@ fn quickstart(ui: &mut egui::Ui) {
 }
 
 impl App {
+    /// The graphics cards listed again by an installed upscaler, beside the window (`Msg::Gpus`); the menu shows
+    /// "detecting" meanwhile.
+    fn detect_gpus(&mut self) {
+        self.gpus = None;
+        let (tools, tx) = (Tools { dir: self.settings.tools_dir.clone() }, self.tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::Gpus(upscale::list_gpus(&tools)));
+        });
+    }
+
     /// The Refresh estimates button and whether what is shown matches the settings.
     fn estimate_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1360,6 +1377,7 @@ impl App {
     fn settings_view(&mut self, ui: &mut egui::Ui) {
         let mut s = self.settings.clone();
         let info = self.env_info.clone();
+        let mut detect = false;  // (Settings > GPU > Detect)
         egui::ScrollArea::vertical().show(ui, |ui| {
             self.models_section(ui);
             self.estimate_controls(ui);
@@ -1511,16 +1529,32 @@ impl App {
             ui.heading("GPU");
             ui.horizontal(|ui| {
                 ui.label("Device");
+                // the cards the upscalers listed (none yet, or no tool: GPU 0 to 3 unnamed)
+                let cards: Vec<(i32, String)> = match self.gpus.as_deref() {
+                    Some(g) if !g.is_empty() => g.to_vec(),
+                    _ => (0..4).map(|n| (n, String::new())).collect(),
+                };
                 let name = |g: i32| match g {
                     upscale::GPU_AUTO => "Automatic (discrete card first)".to_string(),
                     -1 => "CPU".to_string(),
-                    n => format!("GPU {n}"),
+                    n => match cards.iter().find(|(m, _)| *m == n) {
+                        Some((_, card)) if !card.is_empty() => format!("GPU {n}: {card}"),
+                        _ => format!("GPU {n}"),
+                    },
                 };
                 egui::ComboBox::from_id_salt("gpu").selected_text(name(s.gpu)).show_ui(ui, |ui| {
-                    for g in [upscale::GPU_AUTO, -1, 0, 1, 2, 3] {
+                    for g in [upscale::GPU_AUTO, -1].into_iter().chain(cards.iter().map(|(n, _)| *n)) {
                         ui.selectable_value(&mut s.gpu, g, name(g));
                     }
                 });
+                if ui.button("Detect").on_hover_text("List this PC's graphics cards again, as the upscalers see them").clicked() {
+                    detect = true;
+                }
+                match self.gpus.as_deref() {
+                    None => ui.label("detecting..."),
+                    Some([]) => ui.label(RichText::new("no graphics card found (install the upscaling models first)").color(Color32::from_rgb(230, 170, 80))),
+                    Some(g) => ui.label(RichText::new(format!("{} found", g.len())).weak()),
+                };
                 ui.label(RichText::new("Automatic picks a discrete card (such as an NVIDIA or AMD graphics card) over on-board graphics. GPU n: the n-th Vulkan device. CPU: Real-ESRGAN cannot run there and falls back to Lanczos.").weak());
             });
             ui.add(egui::Slider::new(&mut s.tile, 0..=1024).text("tile size (0 = automatic from VRAM)"));
@@ -1590,6 +1624,9 @@ impl App {
                 s.tools_dir = keep.1;
             }
         });
+        if detect {
+            self.detect_gpus();
+        }
         if serde_json::to_string(&s).ok() != serde_json::to_string(&self.settings).ok() {
             // Folders decide no plan: changing only those must not mark the estimates out of date.
             let mut same = s.clone();
