@@ -1511,8 +1511,17 @@ impl App {
             ui.heading("GPU");
             ui.horizontal(|ui| {
                 ui.label("Device");
-                ui.add(egui::DragValue::new(&mut s.gpu).range(-1..=8));
-                ui.label("(-1 = CPU; Real-ESRGAN needs a Vulkan GPU and falls back to Lanczos)");
+                let name = |g: i32| match g {
+                    upscale::GPU_AUTO => "Automatic (discrete card first)".to_string(),
+                    -1 => "CPU".to_string(),
+                    n => format!("GPU {n}"),
+                };
+                egui::ComboBox::from_id_salt("gpu").selected_text(name(s.gpu)).show_ui(ui, |ui| {
+                    for g in [upscale::GPU_AUTO, -1, 0, 1, 2, 3] {
+                        ui.selectable_value(&mut s.gpu, g, name(g));
+                    }
+                });
+                ui.label(RichText::new("Automatic picks a discrete card (such as an NVIDIA or AMD graphics card) over on-board graphics. GPU n: the n-th Vulkan device. CPU: Real-ESRGAN cannot run there and falls back to Lanczos.").weak());
             });
             ui.add(egui::Slider::new(&mut s.tile, 0..=1024).text("tile size (0 = automatic from VRAM)"));
             ui.add(egui::Slider::new(&mut s.batch, 1..=256).text("textures per model run"));

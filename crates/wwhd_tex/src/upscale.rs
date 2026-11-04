@@ -229,6 +229,17 @@ pub struct Output {
 const PAD: u32 = 16;
 
 /// Upscale a batch. Alpha is resized with Catmull-Rom; colour with the backend.
+/// `Settings::gpu`: no `-g`, so each ncnn tool picks its default device, a discrete GPU before an integrated one
+/// (ncnn's `get_default_gpu_index`); Vulkan's device order alone can put the on-board GPU first.
+pub const GPU_AUTO: i32 = -2;
+
+/// The `-g` value for a tool run, or `None` to leave the choice to the tool: automatic, and the CPU for the tools
+/// that have no CPU path (Real-ESRGAN and custom ESRGAN models: they fail and fall back to Lanczos-3).
+fn gpu_arg(b: &BackendChoice, gpu: i32) -> Option<String> {
+    let cpu_capable = !matches!(b, BackendChoice::RealEsrgan(_) | BackendChoice::Custom(_));
+    (gpu != GPU_AUTO && (gpu >= 0 || cpu_capable)).then(|| gpu.to_string())
+}
+
 pub fn run(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Path, jobs: &[Job], cancel: &AtomicBool) -> Result<Vec<Output>> {
     let colour: Vec<Output> = match b {
         BackendChoice::Native => jobs.iter().map(|j| Output { w: j.w, h: j.h, rgba: j.rgba.clone() }).collect(),
@@ -333,8 +344,8 @@ fn run_ncnn(b: &BackendChoice, tools: &Tools, gpu: i32, tile: u32, scratch: &Pat
         .arg("png")
         .arg("-t")
         .arg(tile.to_string());
-    if !matches!(b, BackendChoice::RealEsrgan(_) | BackendChoice::Custom(_)) || gpu >= 0 {
-        cmd.arg("-g").arg(gpu.to_string());
+    if let Some(g) = gpu_arg(b, gpu) {
+        cmd.arg("-g").arg(g);
     }
     match b {
         BackendChoice::RealEsrgan(m) => {
@@ -435,6 +446,19 @@ pub fn upscale_normal_map(w: u32, h: u32, rgba: &[u8], scale: u32, two_channel: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpu_automatic_passes_no_device_and_cpu_only_where_the_tool_has_one() {
+        let esrgan = BackendChoice::default();
+        assert!(matches!(esrgan, BackendChoice::RealEsrgan(_)));
+        let waifu = BackendChoice::Waifu2x { model: "models-cunet".into(), noise: 0 };
+        assert_eq!(gpu_arg(&esrgan, GPU_AUTO), None);
+        assert_eq!(gpu_arg(&waifu, GPU_AUTO), None);
+        assert_eq!(gpu_arg(&esrgan, 1).as_deref(), Some("1"));
+        assert_eq!(gpu_arg(&esrgan, -1), None);
+        assert_eq!(gpu_arg(&waifu, -1).as_deref(), Some("-1"));
+        assert_eq!(crate::project::Settings::default().gpu, GPU_AUTO);
+    }
+
     use super::*;
 
     #[test]

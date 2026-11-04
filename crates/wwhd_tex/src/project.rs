@@ -50,7 +50,7 @@ pub struct Settings {
     /// Backend per class; classes not listed use `default_backend`.
     pub backends: Vec<(Class, BackendChoice)>,
     pub default_backend: BackendChoice,
-    /// GPU index for ncnn tools; -1 forces CPU.
+    /// GPU index for ncnn tools; -1 forces CPU; `upscale::GPU_AUTO` (the default) lets each tool pick, a discrete GPU first.
     pub gpu: i32,
     /// ncnn tile size; 0 = automatic.
     pub tile: u32,
@@ -134,7 +134,7 @@ impl Default for Settings {
             min_source_dim: 16,
             backends: crate::upscale::default_class_backends(),
             default_backend: BackendChoice::default(),
-            gpu: 0,
+            gpu: crate::upscale::GPU_AUTO,
             tile: 0,
             batch: 32,
             tools_dir: PathBuf::from("tools/upscalers"),
