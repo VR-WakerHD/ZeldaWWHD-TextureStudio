@@ -122,9 +122,11 @@ pub fn halo_fraction(w: u32, h: u32, reference: &[u8], b: &[u8], margin: f32) ->
     over as f32 / n.max(1) as f32
 }
 
+/// PSNR of RGB over texels of `a` at least half opaque (all texels when none is).
 pub fn psnr_rgb(a: &[u8], b: &[u8]) -> f32 {
     let (mut se, mut n) = (0f64, 0f64);
-    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+    let any = a.chunks_exact(4).any(|p| p[3] >= 128);
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)).filter(|(x, _)| !any || x[3] >= 128) {
         for c in 0..3 {
             se += (x[c] as f64 - y[c] as f64).powi(2);
         }
@@ -134,7 +136,8 @@ pub fn psnr_rgb(a: &[u8], b: &[u8]) -> f32 {
     if mse <= 1e-9 { 99.0 } else { (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32 }
 }
 
-/// Mean SSIM of lightness (8×8 windows, stride 4), over windows with visible texels.
+/// Mean SSIM of lightness (8×8 windows, stride 4) over texels at least half opaque, in windows where those are the
+/// majority. Faint edge texels are left out: their colour barely shows, and upscalers fill it differently.
 pub fn ssim(w: u32, h: u32, a: &[u8], b: &[u8]) -> f32 {
     let (w, h) = (w as usize, h as usize);
     let la: Vec<f32> = oklab(a).iter().map(|v| v[0]).collect();
@@ -146,7 +149,7 @@ pub fn ssim(w: u32, h: u32, a: &[u8], b: &[u8]) -> f32 {
     while y + win <= h {
         let mut x = 0;
         while x + win <= w {
-            let idx: Vec<usize> = (0..win * win).map(|k| (y + k / win) * w + x + k % win).filter(|&i| a[i * 4 + 3] > 0).collect();
+            let idx: Vec<usize> = (0..win * win).map(|k| (y + k / win) * w + x + k % win).filter(|&i| a[i * 4 + 3] >= 128).collect();
             if idx.len() > win * win / 2 {
                 let m = idx.len() as f32;
                 let (ma, mb) = (idx.iter().map(|&i| la[i]).sum::<f32>() / m, idx.iter().map(|&i| lb[i]).sum::<f32>() / m);
@@ -224,6 +227,18 @@ mod tests {
         assert!(delta_e(&img, &img) < 1e-4);
         assert_eq!(halo_fraction(8, 8, &img, &img, 0.01), 0.0);
         assert_eq!(alpha_intact(&img, &img), (true, true));
+    }
+
+    #[test]
+    fn fidelity_ignores_colour_under_faint_alpha() {
+        // Same visible picture; only the colour under alpha 10 differs.
+        let a: Vec<u8> = (0..256u32).flat_map(|i| if i % 16 < 8 { [200, 100, 50, 255] } else { [0, 0, 0, 10] }).collect();
+        let mut b = a.clone();
+        for p in b.chunks_exact_mut(4).filter(|p| p[3] == 10) {
+            p[..3].copy_from_slice(&[255, 255, 255]);
+        }
+        assert!((ssim(16, 16, &a, &b) - 1.0).abs() < 1e-4);
+        assert_eq!(psnr_rgb(&a, &b), 99.0);
     }
 
     #[test]

@@ -14,9 +14,14 @@
 //! colours too, and the conversion back uses the same curve, so a no-op profile
 //! gives back the exact input bytes.
 //!
-//! Alpha is never written. Filters weight neighbours by alpha, so the colour
-//! hidden under transparent pixels cannot bleed into visible edges, and pixels
-//! with alpha 0 keep their colour unless `fill_transparent` is on.
+//! Alpha is written only for cut-out textures with *crisp cut-out edges* on: the
+//! edge is rebuilt from the original along the same contour, so coverage stays the
+//! same. Blended alpha is never written. Filters weight neighbours by alpha, so the
+//! colour hidden under transparent pixels cannot bleed into visible edges, and
+//! pixels with alpha 0 keep their colour unless `fill_transparent` is on.
+//!
+//! Halo removal keeps the upscale's lightness within the original's local range,
+//! which removes the rims upscalers (AI models and Lanczos alike) add along edges.
 //!
 //! Data textures (normal maps, masks, ramps, one- and two-channel formats) and
 //! textures of unknown class are never enhanced.
@@ -151,6 +156,25 @@ impl Default for Colour {
     }
 }
 
+/// Fixes for upscaling artefacts, applied before sharpening and colour. Both work from the original texture.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Cleanup {
+    /// Remove the bright/dark rims upscalers add along strong edges (0 = off, 1 = full): lightness is kept within
+    /// the original's local range (3x3 source texels, interpolated) plus about 2 levels. Detail the upscaler made
+    /// inside that range stays.
+    pub dering: f32,
+    /// Cut-out textures (alpha mostly 0 or 255) get their alpha rebuilt from the original: the same smooth contour,
+    /// re-sharpened to a 1-2 pixel anti-aliased edge instead of the soft enlarged one. Blended alpha is left alone.
+    pub crisp_cutouts: bool,
+}
+
+impl Default for Cleanup {
+    fn default() -> Self {
+        Cleanup { dering: 1.0, crisp_cutouts: true }
+    }
+}
+
 /// One processing profile.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -164,6 +188,8 @@ pub struct Profile {
     /// Mips are reduced with a Catmull-Rom filter (in linear light for sRGB) instead of a 2×2 box: distant
     /// surfaces stay crisper. Colour textures only.
     pub sharp_mips: bool,
+    /// Upscaling artefact fixes (halo removal, crisp cut-out edges).
+    pub cleanup: Cleanup,
 }
 
 impl Default for Profile {
@@ -190,13 +216,14 @@ pub fn original() -> Profile {
         colour: Colour { enabled: false, saturation: 0.0, vibrance: 0.0, contrast: 0.0, ..Colour::default() },
         per_class: true,
         sharp_mips: false,
+        cleanup: Cleanup::default(),
     }
 }
 
 /// Moderate sharpening, mild vibrance and contrast, balanced detail recovery: the specification's defaults (the
 /// project default is [`enhanced_vibrant`], which adds colour on top of this).
 pub fn enhanced() -> Profile {
-    Profile { name: ENHANCED.into(), sharpen: Sharpen::default(), detail: Detail::default(), colour: Colour::default(), per_class: true, sharp_mips: true }
+    Profile { name: ENHANCED.into(), sharpen: Sharpen::default(), detail: Detail::default(), colour: Colour::default(), per_class: true, sharp_mips: true, cleanup: Cleanup::default() }
 }
 
 /// Stronger edges and detail, still halo-suppressed; colour kept controlled.
@@ -208,6 +235,7 @@ pub fn ultra() -> Profile {
         colour: Colour { saturation: 0.08, vibrance: 0.08, contrast: 0.04, ..Colour::default() },
         per_class: true,
         sharp_mips: true,
+        cleanup: Cleanup::default(),
     }
 }
 
@@ -221,6 +249,7 @@ pub fn ultra_plus() -> Profile {
         colour: Colour { saturation: 0.08, vibrance: 0.08, contrast: 0.04, ..Colour::default() },
         per_class: true,
         sharp_mips: true,
+        cleanup: Cleanup::default(),
     }
 }
 
@@ -453,7 +482,7 @@ pub fn cache_tag(profile: &Profile, s: &EnhanceSettings, t: &Target) -> String {
     if !s.enabled {
         return "enhance-off".into();
     }
-    format!("enhance-v1:{}:{}:{t:?}", serde_json::to_string(profile).unwrap_or_default(), s.fill_transparent)
+    format!("enhance-v2:{}:{}:{t:?}", serde_json::to_string(profile).unwrap_or_default(), s.fill_transparent)
 }
 
 /// A profile with the per-texture tuning applied: exactly what runs.
@@ -469,6 +498,12 @@ pub struct Resolved {
     pub edge: Option<Edge>,
     pub fill_transparent: bool,
     pub sharp_mips: bool,
+    /// Halo removal strength (0 = off); needs the original.
+    #[serde(default)]
+    pub dering: f32,
+    /// Rebuild the alpha edge from the original when the original is a cut-out (alpha mostly 0 or 255).
+    #[serde(default)]
+    pub crisp_cutouts: bool,
 }
 
 impl Resolved {
@@ -477,7 +512,7 @@ impl Resolved {
         format!("enhance-v1:{}:{:?}", serde_json::to_string(self).unwrap_or_default(), self.edge)
     }
     pub fn is_noop(&self) -> bool {
-        self.sharpen.is_none() && self.detail.is_none() && self.colour.is_none() && !self.fill_transparent
+        self.sharpen.is_none() && self.detail.is_none() && self.colour.is_none() && !self.fill_transparent && self.dering <= 0.0 && !self.crisp_cutouts
     }
 }
 
@@ -531,7 +566,24 @@ pub fn resolve(profile: &Profile, s: &EnhanceSettings, t: &Target, rgba: &[u8]) 
     };
     let colour = (c.enabled && k > 0.0 && !colour_is_noop(&colour)).then_some(colour);
     let fill = s.fill_transparent && crate::mips::is_alpha_tested(rgba);
-    Some(Resolved { profile: profile.name.clone(), category, sharpen, detail, colour, scale: t.scale.max(1), edge: Some(t.edge), fill_transparent: fill, sharp_mips: profile.sharp_mips })
+    let upscaled = t.scale > 1;
+    let dering = if upscaled { profile.cleanup.dering.clamp(0.0, 1.0) } else { 0.0 };
+    // Whether the texture is a cut-out is decided from the original in `apply` (an enlarged cut-out has many soft
+    // edge texels and no longer looks like one).
+    let crisp = upscaled && profile.cleanup.crisp_cutouts;
+    Some(Resolved {
+        profile: profile.name.clone(),
+        category,
+        sharpen,
+        detail,
+        colour,
+        scale: t.scale.max(1),
+        edge: Some(t.edge),
+        fill_transparent: fill,
+        sharp_mips: profile.sharp_mips,
+        dering,
+        crisp_cutouts: crisp,
+    })
 }
 
 // ---- colour space ----------------------------------------------------------------------------------------------
@@ -858,28 +910,65 @@ fn fill_transparent(w: usize, h: usize, rgba: &mut [u8]) {
     }
 }
 
+/// The cut-out alpha rebuilt from the original's alpha (`ow` x `oh`) at `w` x `h`: a smooth enlargement keeps the
+/// contour (and so the coverage at the 0.5 test), then a steep ramp makes the edge 1-2 pixels wide.
+pub fn crisp_alpha(ow: usize, oh: usize, orig: &[u8], w: usize, h: usize, scale: u32, edge: Edge) -> Vec<u8> {
+    let a: Vec<f32> = orig.chunks_exact(4).map(|p| p[3] as f32 / 255.0).collect();
+    let up = resample::resize(ow, oh, 1, &a, w, h, Filter::CatmullRom, edge);
+    let half = (0.4 / scale.max(1) as f32).clamp(0.05, 0.5);
+    up.par_iter().map(|v| (smoothstep(0.5 - half, 0.5 + half, *v) * 255.0 + 0.5) as u8).collect()
+}
+
+/// Lightness bounds from the original: the 3x3-texel min and max around each source texel, enlarged smoothly to the
+/// output size. An upscale's lightness outside these bounds is ringing or a halo.
+fn source_bounds(ol: &[f32], ow: usize, oh: usize, w: usize, h: usize, edge: Edge) -> (Vec<f32>, Vec<f32>) {
+    let (mn, mx) = local_range(ow, oh, ol, 1, edge);
+    (resample::resize(ow, oh, 1, &mn, w, h, Filter::Bilinear, edge), resample::resize(ow, oh, 1, &mx, w, h, Filter::Bilinear, edge))
+}
+
+/// Halo removal margin (Oklab L, about 2 levels).
+const DERING_MARGIN: f32 = 2.0 * LEVEL;
+
 /// Stats from one run, for logs and benchmarks.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Stats {
     pub busyness_factor: f32,
     pub millis: f32,
+    /// Share of texels whose lightness halo removal pulled back.
+    #[serde(default)]
+    pub dering_fraction: f32,
+    /// The alpha edge was rebuilt (the original is a cut-out).
+    #[serde(default)]
+    pub crisp_cutout: bool,
 }
 
 /// Enhance an RGBA8 image (straight alpha). `original` is the source the upscale was made from, for restoration.
 /// Alpha bytes are returned unchanged.
 pub fn apply(w: u32, h: u32, rgba: &[u8], r: &Resolved, original: Option<(u32, u32, &[u8])>) -> (Vec<u8>, Stats) {
     let started = std::time::Instant::now();
-    let mut stats = Stats { busyness_factor: 1.0, millis: 0.0 };
+    let mut stats = Stats { busyness_factor: 1.0, millis: 0.0, dering_fraction: 0.0, crisp_cutout: false };
     if r.is_noop() {
         return (rgba.to_vec(), stats);
     }
     let (w, h) = (w as usize, h as usize);
     let edge = r.edge.unwrap_or(Edge::Clamp);
     let mut out = rgba.to_vec();
+    // The original at the matching size, if given (crisp edges, halo removal and restoration need it).
+    let original = original.filter(|(ow, oh, _)| *ow as usize * r.scale as usize == w && *oh as usize * r.scale as usize == h);
+    if r.crisp_cutouts {
+        if let Some((ow, oh, orig)) = original.filter(|(_, _, o)| crate::mips::is_alpha_tested(o) && !has_blended_alpha(o)) {
+            stats.crisp_cutout = true;
+            let a = crisp_alpha(ow as usize, oh as usize, orig, w, h, r.scale, edge);
+            for (p, v) in out.chunks_exact_mut(4).zip(a) {
+                p[3] = v;
+            }
+        }
+    }
     if r.fill_transparent {
         fill_transparent(w, h, &mut out);
     }
-    if r.sharpen.is_none() && r.detail.is_none() && r.colour.is_none() {
+    let dering = if original.is_some() { r.dering } else { 0.0 };
+    if r.sharpen.is_none() && r.detail.is_none() && r.colour.is_none() && dering <= 0.0 {
         stats.millis = started.elapsed().as_secs_f32() * 1000.0;
         return (out, stats);
     }
@@ -888,12 +977,30 @@ pub fn apply(w: u32, h: u32, rgba: &[u8], r: &Resolved, original: Option<(u32, u
     let wt: Vec<f32> = out.chunks_exact(4).map(|p| p[3] as f32 / 255.0).collect();
     let l0: Vec<f32> = lab.iter().map(|v| v[0]).collect();
     let mut l = l0.clone();
+    let orig_l: Option<(Vec<f32>, usize, usize)> = original.map(|(ow, oh, orig)| {
+        (orig.par_chunks_exact(4).map(|p| linear_to_oklab([lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]])[0]).collect(), ow as usize, oh as usize)
+    });
+    if dering > 0.0 {
+        if let Some((ol, ow, oh)) = &orig_l {
+            let (mn, mx) = source_bounds(ol, *ow, *oh, w, h, edge);
+            let mut n = 0usize;
+            for (i, v) in l.iter_mut().enumerate() {
+                let c = v.clamp(mn[i] - DERING_MARGIN, mx[i] + DERING_MARGIN);
+                if c != *v {
+                    n += 1;
+                }
+                *v += dering * (c - *v);
+            }
+            stats.dering_fraction = n as f32 / l.len().max(1) as f32;
+        }
+    }
+    // Later stages are held to the range of this cleaned image, so they cannot bring a removed halo back.
+    let base = l.clone();
 
     if let Some(d) = &r.detail {
         if d.restore > 0.0 {
-            if let Some((ow, oh, orig)) = original {
-                let ol: Vec<f32> = orig.chunks_exact(4).map(|p| linear_to_oklab([lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]])[0]).collect();
-                restore_l(w, h, &mut l, &wt, d.restore, r.scale, &ol, ow as usize, oh as usize, edge);
+            if let Some((ol, ow, oh)) = &orig_l {
+                restore_l(w, h, &mut l, &wt, d.restore, r.scale, ol, *ow, *oh, edge);
             }
         }
         detail_l(w, h, &mut l, &wt, d, r.scale, edge);
@@ -906,7 +1013,7 @@ pub fn apply(w: u32, h: u32, rgba: &[u8], r: &Resolved, original: Option<(u32, u
     let suppress = r.sharpen.map_or(r.detail.is_some(), |s| s.halo_suppression);
     if suppress && (r.sharpen.is_some() || r.detail.is_some()) {
         let margin = r.sharpen.map_or(1.0, |s| s.halo_margin).clamp(0.0, 20.0) * LEVEL;
-        let (mn, mx) = local_range(w, h, &l0, HALO_WINDOW, edge);
+        let (mn, mx) = local_range(w, h, &base, HALO_WINDOW, edge);
         l.par_iter_mut().enumerate().for_each(|(i, v)| *v = v.clamp(mn[i] - margin, mx[i] + margin));
     }
     let mean_l = {
@@ -982,6 +1089,7 @@ mod tests {
         p.sharpen.enabled = false;
         p.detail.enabled = false;
         p.colour.enabled = false;
+        p.cleanup = Cleanup { dering: 0.0, crisp_cutouts: false };
         let r = resolve(&p, &EnhanceSettings::default(), &target(Class::Rock), &img).unwrap();
         assert!(r.is_noop());
         assert_eq!(apply(64, 64, &img, &r, None).0, img);
@@ -1001,7 +1109,8 @@ mod tests {
     #[test]
     fn alpha_is_never_changed_and_hidden_colour_stays() {
         let img = art(64, 64, true);
-        for prof in builtins() {
+        for mut prof in builtins() {
+            prof.cleanup.crisp_cutouts = false;
             let r = resolve(&prof, &EnhanceSettings::default(), &target(Class::Foliage), &img).unwrap();
             let (out, _) = apply(64, 64, &img, &r, Some((16, 16, &art(16, 16, true))));
             for (a, b) in out.chunks_exact(4).zip(img.chunks_exact(4)) {
@@ -1266,12 +1375,110 @@ mod tests {
         assert!(is_builtin(&x.name) && x.colour.protect_highlights && x.colour.protect_shadows);
     }
 
+    /// A cut-out disc: alpha 255 inside radius `r` (in source texels), 0 outside.
+    fn disc(n: u32, r: f32) -> Vec<u8> {
+        (0..n * n)
+            .flat_map(|i| {
+                let (x, y) = ((i % n) as f32 + 0.5 - n as f32 / 2.0, (i / n) as f32 + 0.5 - n as f32 / 2.0);
+                [90, 160, 60, if (x * x + y * y).sqrt() < r { 255 } else { 0 }]
+            })
+            .collect()
+    }
+
+    fn soft_upscale(n: u32, src: &[u8], scale: u32) -> Vec<u8> {
+        resample::resize_rgba8(n, n, src, n * scale, n * scale, Filter::CatmullRom, Edge::Clamp)
+    }
+
+    #[test]
+    fn crisp_cutouts_narrow_the_edge_and_keep_the_coverage() {
+        let (n, sc) = (16u32, 4u32);
+        let src = disc(n, 5.0);
+        let soft = soft_upscale(n, &src, sc);
+        let mut p = enhanced();
+        p.sharpen.enabled = false;
+        p.detail.enabled = false;
+        p.colour.enabled = false;
+        p.cleanup.dering = 0.0;
+        let t = Target { edge: Edge::Clamp, ..target(Class::Foliage) };
+        let r = resolve(&p, &EnhanceSettings::default(), &t, &soft).unwrap();
+        assert!(r.crisp_cutouts, "a cut-out texture");
+        let (out, st) = apply(n * sc, n * sc, &soft, &r, Some((n, n, &src)));
+        assert!(st.crisp_cutout);
+        let partial = |d: &[u8]| d.chunks_exact(4).filter(|p| p[3] > 16 && p[3] < 240).count();
+        let cover = |d: &[u8]| d.chunks_exact(4).filter(|p| p[3] >= 128).count() as f32;
+        assert!(partial(&out) * 2 < partial(&soft), "edge pixels {} vs {}", partial(&out), partial(&soft));
+        assert!((cover(&out) / cover(&soft) - 1.0).abs() < 0.03, "coverage {} vs {}", cover(&out), cover(&soft));
+        // Colour is not touched by this step.
+        assert!(out.chunks_exact(4).zip(soft.chunks_exact(4)).all(|(a, b)| a[..3] == b[..3]));
+        // Without the original nothing can be rebuilt: alpha stays.
+        assert_eq!(apply(n * sc, n * sc, &soft, &r, None).0, soft);
+    }
+
+    #[test]
+    fn blended_alpha_is_never_rebuilt() {
+        let n = 16u32;
+        let src: Vec<u8> = (0..n * n).flat_map(|i| [120, 120, 120, (i * 255 / (n * n)) as u8]).collect();
+        let up = soft_upscale(n, &src, 4);
+        let r = resolve(&enhanced(), &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Particle) }, &up).unwrap();
+        let (out, st) = apply(n * 4, n * 4, &up, &r, Some((n, n, &src)));
+        assert!(!st.crisp_cutout, "the original's alpha blends: not a cut-out");
+        assert!(out.chunks_exact(4).zip(up.chunks_exact(4)).all(|(a, b)| a[3] == b[3]));
+    }
+
+    #[test]
+    fn halo_removal_pulls_upscaler_rims_back_to_the_originals_range() {
+        // Original: a hard step 60 | 200. "Upscale": the step x4 with a bright rim (245) and a dark rim (15) beside it.
+        let (n, sc) = (16u32, 4u32);
+        let src: Vec<u8> = (0..n * n).flat_map(|i| { let v = if i % n < 8 { 60 } else { 200 }; [v, v, v, 255] }).collect();
+        let w = n * sc;
+        let up: Vec<u8> = (0..w * w)
+            .flat_map(|i| {
+                let x = i % w;
+                let v = match x { 30 | 31 => 15, 32 | 33 => 245, x if x < 32 => 60, _ => 200 };
+                [v, v, v, 255]
+            })
+            .collect();
+        let mut p = enhanced();
+        p.sharpen.enabled = false;
+        p.detail.enabled = false;
+        p.colour.enabled = false;
+        let r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Rock) }, &up).unwrap();
+        assert!(r.dering > 0.0);
+        let (out, st) = apply(w, w, &up, &r, Some((n, n, &src)));
+        let row: Vec<i32> = (0..w as usize).map(|x| out[x * 4] as i32).collect();
+        assert!(row.iter().all(|v| (55..=206).contains(v)), "rims removed: {:?}", &row[26..38]);
+        assert!(st.dering_fraction > 0.0);
+        // Flat areas far from the edge are untouched.
+        assert_eq!((row[5], row[60]), (60, 200));
+        // Off: the rims stay.
+        p.cleanup.dering = 0.0;
+        let r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Rock) }, &up).unwrap();
+        assert_eq!(apply(w, w, &up, &r, Some((n, n, &src))).0, up);
+    }
+
+    #[test]
+    fn halo_removal_keeps_detail_inside_the_originals_range() {
+        // Texture whose upscale adds in-range detail (values between the original's local min and max).
+        let (n, sc) = (16u32, 4u32);
+        let src: Vec<u8> = (0..n * n).flat_map(|i| { let v = if (i % n + i / n) % 2 == 0 { 80 } else { 180 }; [v, v, v, 255] }).collect();
+        let w = n * sc;
+        let up: Vec<u8> = (0..w * w).flat_map(|i| { let v = 100 + ((i * 37) % 60) as u8; [v, v, v, 255] }).collect();
+        let mut p = enhanced();
+        p.sharpen.enabled = false;
+        p.detail.enabled = false;
+        p.colour.enabled = false;
+        let r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Wrap, ..target(Class::Rock) }, &up).unwrap();
+        let (out, _) = apply(w, w, &up, &r, Some((n, n, &src)));
+        assert_eq!(out, up, "everything is inside 80..180, so nothing changes");
+    }
+
     #[test]
     fn settings_without_the_new_fields_still_load() {
         let s: EnhanceSettings = serde_json::from_str("{}").unwrap();
         assert_eq!(s, EnhanceSettings::default());
         let p: Profile = serde_json::from_str(r#"{"name":"x","sharpen":{"amount":0.2}}"#).unwrap();
         assert_eq!(p.sharpen.amount, 0.2);
+        assert_eq!(p.cleanup, Cleanup::default(), "profiles saved before clean-up existed get it on");
         assert_eq!(p.sharpen.radius, 0.6);
     }
 }

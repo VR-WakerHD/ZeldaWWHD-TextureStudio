@@ -123,10 +123,11 @@ fn render(r: &Req) -> Result<(ColorImage, String), String> {
     if let Some(p) = &r.profile {
         match enhance::resolve(p, &r.settings, &r.target, &raw) {
             Some(res) => {
-                let original = res.detail.filter(|d| d.restore > 0.0).and_then(|_| load_png(&r.master).ok());
+                let needs_original = res.dering > 0.0 || res.crisp_cutouts || res.detail.is_some_and(|d| d.restore > 0.0);
+                let original = needs_original.then(|| load_png(&r.master).ok()).flatten();
                 let (out, st) = enhance::apply(w, h, &raw, &res, original.as_ref().map(|(a, b, c)| (*a, *b, &c[..])));
                 img = out;
-                info = format!("{} · {} · {:.0} ms · adaptive ×{:.2}", p.name, res.category.label(), st.millis, st.busyness_factor);
+                info = format!("{} · {} · {:.0} ms · adaptive ×{:.2} · halo removal touched {:.1} %{}", p.name, res.category.label(), st.millis, st.busyness_factor, st.dering_fraction * 100.0, if st.crisp_cutout { " · cut-out edges rebuilt" } else { "" });
             }
             None => info = format!("{}: not enhanced ({})", p.name, enhance::category(r.target.class, r.target.format, &raw).label()),
         }
@@ -324,6 +325,10 @@ fn profile_editor(ui: &mut egui::Ui, p: &mut Profile) -> bool {
         ch |= ui.checkbox(&mut c.protect_highlights, "Highlight clipping protection").changed();
         ch |= ui.checkbox(&mut c.protect_shadows, "Shadow detail protection").changed();
     });
+    ui.separator();
+    ui.label(RichText::new("Clean-up").strong());
+    ch |= pct(ui, &mut p.cleanup.dering, 0.0..=1.0, "halo removal", "Removes the bright and dark rims upscalers add along strong edges: lightness stays within the original's local range. Detail inside that range is kept");
+    ch |= ui.checkbox(&mut p.cleanup.crisp_cutouts, "Crisp cut-out edges").on_hover_text("Cut-out textures (leaves, fences, grates) get their alpha rebuilt from the original: same outline, 1-2 pixel edge instead of a soft blur. Blended transparency is left alone").changed();
     ui.separator();
     ch |= ui.checkbox(&mut p.per_class, "Tune per texture class").on_hover_text("Strengths scaled per class: e.g. water and sky sharpened less, stone more, UI colours never changed. Low-confidence classes get 60 %").changed();
     ch |= ui.checkbox(&mut p.sharp_mips, "Sharper mips (Catmull-Rom)").on_hover_text("Distant mip levels reduced with Catmull-Rom instead of a 2×2 box: crisper at a distance").changed();

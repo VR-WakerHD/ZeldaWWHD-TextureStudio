@@ -17,7 +17,7 @@ No game data is part of this repository, and none is written into it.
 | GX2 decode (BC1–BC5, RGBA8, R8, RG8, 565, 5551, 4444; tiled/linear; mips) | Working; layout + tiling verified byte-exact against 14 561 of 14 572 textures |
 | Classification (metadata + pixel statistics, manual override) | Working; rules, confidence, persisted overrides. No AI classifier |
 | Upscaling | Lanczos/Catmull-Rom/Mitchell/bilinear/nearest in-process; Real-ESRGAN, waifu2x, Real-CUGAN, RealSR via the official ncnn/Vulkan releases; custom ncnn models |
-| Post-upscale enhancement | Sharpening, edge-preserving detail recovery and colour (Oklab, gamut-mapped), per-class tuning, profiles Original / Enhanced / **Enhanced & Extra Vibrant** (default) / Ultra Sharp / Ultra Sharp + / Ultra Sharp & Ultra Vibrant / custom; alpha and data textures untouched; Enhance tab with split, side-by-side and variant comparisons; `enhance-bench` QA. See `docs/enhancement.md` |
+| Post-upscale enhancement | Sharpening, edge-preserving detail recovery and colour (Oklab, gamut-mapped), per-class tuning, profiles Original / Enhanced / **Enhanced & Extra Vibrant** (default) / Ultra Sharp / Ultra Sharp + / Ultra Sharp & Ultra Vibrant / custom; clean-up: crisp cut-out edges and AI halo removal; blended alpha and data textures untouched; Enhance tab with split, side-by-side and variant comparisons; `enhance-bench` QA. See `docs/enhancement.md` |
 | Normal maps, masks, ramps, alpha | Vector-aware normal resize + renormalise; masks conventional; ramps native; alpha resized separately |
 | Mip generation | sRGB-linear box filter, alpha-coverage preserving, normal renormalising |
 | Rebuild + validation | FTEX/BFLIM rewrite, SARC/Yaz0 rebuild, reopen + compare, PSNR check of every encoded texture |
@@ -60,8 +60,9 @@ licences. Real-CUGAN and RealSR are not (their model licences are not cleared); 
 
 Settings → **Install Upscaling Models** (or `texture_studio --headless install-tools`) downloads any of them that is
 missing, from these official releases, checked against pinned SHA-256 sums. See `tools/upscalers/README.md`. Without
-any AI tool, every class falls back to Lanczos-3 (logged). Custom ESRGAN-family ncnn models
-(`name.param` + `name.bin`, 4×) can be placed in `tools/upscalers/custom-models/`.
+any AI tool, every class falls back to Lanczos-3 (logged). **4x-AnimeSharp** (Kim2091, non-commercial licence) can
+be installed the same way; it is saved into `tools/upscalers/custom-models/`, where other custom ESRGAN-family ncnn
+models (`name.param` + `name.bin`, 4×) can be placed too.
 
 ## Use
 

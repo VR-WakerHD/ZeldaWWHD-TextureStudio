@@ -40,6 +40,7 @@ wiiu_swizzle itself credits decaf-emu/addrlib (Mesa-derived) and Cemu constants.
 | waifu2x-ncnn-vulkan | 20250915 | MIT | cunet, upconv_7_anime_style_art_rgb, upconv_7_photo | ncnn + Vulkan, CPU | `cunet` with noise 0 produced garbage on the RTX 5080 in testing; caught by the consistency check |
 | realcugan-ncnn-vulkan | 20220728 | MIT | models-se (2–4×), models-pro (2–3×), models-nose (2×) | ncnn + Vulkan, CPU | |
 | realsr-ncnn-vulkan | 20220728 | MIT | DF2K, DF2K_JPEG (4×) | ncnn + Vulkan, CPU | photographic; adds grain to WWHD art |
+| 4x-AnimeSharp (model add-on) | huggingface.co/Kim2091/AnimeSharp, commit 94dab98, `NCNN/4x-AnimeSharp-fp32` | CC BY-NC-SA 4.0 (non-commercial) | one ESRGAN model, 4× | runs in realesrgan-ncnn-vulkan | saved to `custom-models/`; never bundled or committed |
 
 Settings → Upscaling models → **Install Upscaling Models** (and `install-tools` on the command line) downloads
 the missing ones from these exact URLs and checks size and SHA-256 before unpacking (`crates/wwhd_tex/src/tools_install.rs`).
@@ -53,6 +54,14 @@ abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d realesrgan-ncnn
 7425be94b94e4c8f37a1e433ac0e0100c43790e2c37418f4b65d8235adfbdc87 waifu2x-ncnn-vulkan-20250915-windows.zip
 c6e08d46c11704b1e3a1ada9ddd591cb5005f52f132136c8633ba25def400e01 realcugan-ncnn-vulkan-20220728-windows.zip
 db77ca8247642e2b694f1ce0fed3d91f557b75464ff343f5168465fe414223b3 realsr-ncnn-vulkan-20220728-windows.zip
+```
+
+4x-AnimeSharp (same files on every system; checked 2026-11-04 against the repository's LFS SHA-256 and git object
+hash):
+
+```
+0332002123306541c803cd675280eee7f9cdd96f0804a47129f86ebbf9ed4174 4x-AnimeSharp-fp32.param (165579 bytes, git ada726cc)
+d71eed4c6000a8ca6016ffc057be82fbc20d8b3c567bc28a1608db1fb58084e6 4x-AnimeSharp-fp32.bin (66793352 bytes)
 ```
 
 Model weight licences follow their projects: Real-ESRGAN BSD-3-Clause (bundled, `LICENSE-Real-ESRGAN.txt` copied

@@ -19,9 +19,11 @@ output and an unchanged one never re-encodes.
 
 ## What it never touches
 
-- **Alpha**: returned byte for byte. Filters weight neighbours by alpha, so colour hidden under transparent texels
-  cannot bleed into edges, and texels with alpha 0 keep their colour (unless *Fill colour under transparent
-  texels* is on: cut-out textures only, off by default because in some textures alpha is not coverage).
+- **Alpha**: returned byte for byte, except on cut-out textures with *Crisp cut-out edges* on (see Clean-up), where
+  only the edge is rebuilt and coverage stays the same. Blended alpha is never changed. Filters weight neighbours
+  by alpha, so colour hidden under transparent texels cannot bleed into edges, and texels with alpha 0 keep their
+  colour (unless *Fill colour under transparent texels* is on: cut-out textures only, off by default because in
+  some textures alpha is not coverage).
 - **Data textures**: normal maps, masks, ramps, and any one- or two-channel format (BC4, BC5, R8, RG8) are never
   enhanced, whatever their class says.
 - **Unknown class**: not enhanced (it may be data). Set the class by hand to enhance one.
@@ -149,13 +151,48 @@ project's `settings.json` (`enhance.custom`). Each texture can pick its own prof
   the target resolution per screen pixel. Previews are computed on a worker thread from the cached upscale; only the
   images on screen are computed.
 
+## Clean-up
+
+Two steps that fix upscaling artefacts. Both run before detail, sharpening and colour, work from the original
+texture (`masters/`), and are on in every built-in profile (*halo removal* slider and *Crisp cut-out edges* box in
+the profile editor).
+
+**Crisp cut-out edges.** When the *original's* alpha is a cut-out (mostly 0 or 255), the alpha is rebuilt from it.
+The original alpha is enlarged with Catmull-Rom, so the contour and the coverage at the 0.5 test stay where they
+were, then a steep ramp (half-width 0.4/scale) makes the edge 1–2 pixels wide instead of the soft enlarged one.
+Detection uses the original because an enlarged cut-out has so many soft edge texels that it no longer looks like
+one. On 9 cut-out textures (grass, moss, reef, feathers, wing, eye decals, clouds, a door) the half-transparent edge
+texels fell about 10× (for example 17,460 → 1,649), with fidelity the same or better. Blended alpha (clouds of
+smoke, glass, gradients) is left alone.
+
+**Halo removal.** Each texel's Oklab lightness is kept within the original's 3×3-texel minimum and maximum around
+that spot, smoothly interpolated to the output size, plus about 2 levels. Detail the upscaler made inside that range
+stays. Bright and dark rims along edges, the ringing of AI models and of Lanczos alike, are pulled back. Later
+stages (detail, sharpening) are held to the range of this cleaned image, so they cannot bring a removed rim back. On
+Link's tunic (`tc_body`) it removed the pinkish rim outside the dark outline and the bright line inside the glass,
+touching 18 % of the texels, while the outline stayed as crisp. The sharpness measure drops on such textures,
+because the rims it counted as edges are gone.
+
 ## Models
 
 The built-in models are unchanged. Real-ESRGAN `realesrgan-x4plus-anime` is the RealESRGAN_x4plus_anime_6B model.
-`4x-AnimeSharp`, `4x-UltraSharp` and `4x-IllustrationJaNai` are known by name. They are not bundled: their
-licences are non-commercial and they are published as PyTorch files. Converted to ncnn (`<name>.param` + `.bin`,
-ESRGAN/RRDB builds only), they go in `tools/upscalers/custom-models/` and run through `realesrgan-ncnn-vulkan`. A
-custom model counts as installed only when both files are there. Each class lists suggested models, but the class
+
+**4x-AnimeSharp** (Kim2091, CC BY-NC-SA 4.0, non-commercial) is in Settings → *Install Upscaling Models*. It is
+the author's own ncnn fp32 build from huggingface.co/Kim2091/AnimeSharp, pinned to commit 94dab98 and per file by
+size and SHA-256, saved as `tools/upscalers/custom-models/4x-AnimeSharp.param/.bin` (git-ignored, never committed)
+and run by `realesrgan-ncnn-vulkan`. Compared with x4plus anime on 17 textures (2026-11-04), it is more faithful on 16
+(fidelity 0.98–0.997), crisper on ground, grass, roofs and wood (+10 % to +27 %), and softer on UI art, logos and
+characters (−8 % to −26 %). It took 0.9 s per texture at ×4 and about 2.4 GiB of VRAM, with no fallbacks.
+
+`4x-UltraSharp` and `4x-IllustrationJaNai` are known by name but not installable: IllustrationJaNai is published only
+as a PyTorch `.pth` (Google Drive), with no ncnn build. Converted to ncnn (`<name>.param` + `.bin`, ESRGAN/RRDB
+builds only), such models go in `tools/upscalers/custom-models/` and run through `realesrgan-ncnn-vulkan`. A custom
+model counts as installed only when both files are there.
+
+**UI, lettering and effects.** These classes use Lanczos-3 by default. On 8 such textures, Real-ESRGAN anime and
+Real-CUGAN were 25–41 % crisper than Lanczos on painted UI art and gave clean logo edges without ringing, at
+fidelity 0.98 or better. On effects (fire, Jabun's eye) they added little and lost fidelity on fire. The defaults
+are unchanged; switching UI and lettering to an AI model is a per-project choice in Settings. Each class lists suggested models, but the class
 backend stays whatever you chose. Compare models before switching: a more aggressive model is not assumed to be
 better.
 
@@ -172,7 +209,8 @@ This writes `reports/enhance_bench/report.md`, `report.json` and one contact she
 original, AI upscale, +sharpen, +colour, +sharpen+colour, Enhanced, Original profile, Ultra Sharp, then every other
 cached model). It measures sharpness (Sobel of Oklab L), colourfulness (Hasler–Süsstrunk), chroma, ΔE and lightness
 shift against the upscale, halo share, fidelity (the variant reduced to the source size, SSIM/PSNR against the
-original), alpha integrity, and time.
+original, over texels at least half opaque: faint edge texels barely show, and upscalers fill their colour
+differently), alpha integrity, and time.
 
 Results from 2026-11-04 (18 textures, 2 per class, Real-ESRGAN anime ×4, 24 CPU threads, RTX 5080):
 

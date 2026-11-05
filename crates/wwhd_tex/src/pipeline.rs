@@ -580,7 +580,8 @@ pub fn enhance_level0(p: &Project, s: &Settings, inv: &Inventory, i: usize, prof
     if r.is_noop() {
         return (rgba, sharp);
     }
-    let original = r.detail.filter(|d| d.restore > 0.0).and_then(|_| load_png(&p.master_path(&inv.textures[i].key)).ok());
+    let needs_original = r.dering > 0.0 || r.crisp_cutouts || r.detail.is_some_and(|d| d.restore > 0.0);
+    let original = needs_original.then(|| load_png(&p.master_path(&inv.textures[i].key)).ok()).flatten();
     let (out, _) = enhance::apply(w, h, &rgba, &r, original.as_ref().map(|(ow, oh, o)| (*ow, *oh, &o[..])));
     (out, sharp)
 }

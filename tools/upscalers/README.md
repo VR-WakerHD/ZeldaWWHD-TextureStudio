@@ -22,6 +22,7 @@ Left out: the releases' demo images and video, and `vcomp140d.dll` (a Microsoft 
 |---|---|---|
 | Real-CUGAN ncnn Vulkan | https://github.com/nihui/realcugan-ncnn-vulkan/releases/tag/20220728 | code is MIT, but the models' source (bilibili/ailab) has no licence file |
 | RealSR ncnn Vulkan | https://github.com/nihui/realsr-ncnn-vulkan/releases/tag/20220728 | code is MIT, but the models follow Tencent's RealSR terms, not cleared |
+| 4x-AnimeSharp (model for Real-ESRGAN's tool) | https://huggingface.co/Kim2091/AnimeSharp (ncnn fp32, commit 94dab98) | CC BY-NC-SA 4.0: non-commercial; saved into `custom-models/` |
 
 Settings → **Install Upscaling Models** downloads them (and re-installs any missing tool) from these official pages, SHA-256 checked; or unpack them into their own folder here yourself. Custom ESRGAN-family ncnn models
 (`name.param` + `name.bin`, 4×) go in `custom-models/`. Both stay local (git-ignored).
