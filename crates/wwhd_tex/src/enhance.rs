@@ -176,7 +176,10 @@ pub const ORIGINAL: &str = "Wind Waker Original";
 pub const ENHANCED: &str = "Wind Waker Enhanced";
 pub const ULTRA: &str = "Wind Waker Ultra Sharp";
 pub const ULTRA_PLUS: &str = "Wind Waker Ultra Sharp +";
-pub const ULTRA_PLUS_PLUS: &str = "Wind Waker Ultra Sharp ++";
+pub const ULTRA_VIBRANT: &str = "Wind Waker Ultra Sharp & Ultra Vibrant";
+pub const ENHANCED_VIBRANT: &str = "Wind Waker Enhanced & Extra Vibrant";
+/// The profile new projects use, and the fallback for a name that no longer exists.
+pub const DEFAULT_PROFILE: &str = ENHANCED_VIBRANT;
 
 /// Minimal sharpening, colours as painted.
 pub fn original() -> Profile {
@@ -190,7 +193,8 @@ pub fn original() -> Profile {
     }
 }
 
-/// The default: moderate sharpening, mild vibrance and contrast, balanced detail recovery.
+/// Moderate sharpening, mild vibrance and contrast, balanced detail recovery: the specification's defaults (the
+/// project default is [`enhanced_vibrant`], which adds colour on top of this).
 pub fn enhanced() -> Profile {
     Profile { name: ENHANCED.into(), sharpen: Sharpen::default(), detail: Detail::default(), colour: Colour::default(), per_class: true, sharp_mips: true }
 }
@@ -220,18 +224,24 @@ pub fn ultra_plus() -> Profile {
     }
 }
 
-/// The strongest built-in: the boldest radius and amount, detail lifted furthest; threshold 1.5 (at 1 the AI's faint
-/// noise turned into grain). Edge protection and
-/// the 3-level halo margin stay as in Ultra Sharp +: with edge protection off or a larger margin, light rims
-/// appeared around dark shapes (checked on real textures, 2026-11-04).
-pub fn ultra_plus_plus() -> Profile {
+/// Ultra Sharp's sharpening and detail with much stronger colour: vibrance does most of the work (muted colours gain
+/// most, saturated ones little), plus saturation and contrast. Highlight/shadow protection and gamut mapping keep
+/// whites, blacks and hues; per-class tuning still holds water and sky back and leaves UI colours alone.
+pub fn ultra_vibrant() -> Profile {
     Profile {
-        name: ULTRA_PLUS_PLUS.into(),
-        sharpen: Sharpen { radius: 1.0, amount: 1.7, threshold: 1.5, halo_margin: 3.0, ..Sharpen::default() },
-        detail: Detail { amount: 1.1, restore: 0.25, ..Detail::default() },
-        colour: Colour { saturation: 0.08, vibrance: 0.1, contrast: 0.05, ..Colour::default() },
-        per_class: true,
-        sharp_mips: true,
+        name: ULTRA_VIBRANT.into(),
+        colour: Colour { saturation: 0.12, vibrance: 0.25, contrast: 0.06, ..Colour::default() },
+        ..ultra()
+    }
+}
+
+/// Enhanced's sharpening and detail with stronger colour, between Ultra Sharp's and Ultra Vibrant's: for richer
+/// colour without the stronger sharpening. Same protections and per-class tuning.
+pub fn enhanced_vibrant() -> Profile {
+    Profile {
+        name: ENHANCED_VIBRANT.into(),
+        colour: Colour { saturation: 0.10, vibrance: 0.18, contrast: 0.05, ..Colour::default() },
+        ..enhanced()
     }
 }
 
@@ -270,11 +280,11 @@ pub fn with_colour_strength(p: &Profile, k: f32) -> Profile {
 }
 
 pub fn builtins() -> Vec<Profile> {
-    vec![original(), enhanced(), ultra(), ultra_plus(), ultra_plus_plus()]
+    vec![original(), enhanced(), ultra(), ultra_plus(), ultra_vibrant(), enhanced_vibrant()]
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    [ORIGINAL, ENHANCED, ULTRA, ULTRA_PLUS, ULTRA_PLUS_PLUS].contains(&name)
+    [ORIGINAL, ENHANCED, ULTRA, ULTRA_PLUS, ULTRA_VIBRANT, ENHANCED_VIBRANT].contains(&name)
 }
 
 /// Project-wide enhancement settings (in `settings.json`).
@@ -294,14 +304,14 @@ pub struct EnhanceSettings {
 
 impl Default for EnhanceSettings {
     fn default() -> Self {
-        EnhanceSettings { enabled: true, profile: ENHANCED.into(), custom: Vec::new(), fill_transparent: false }
+        EnhanceSettings { enabled: true, profile: DEFAULT_PROFILE.into(), custom: Vec::new(), fill_transparent: false }
     }
 }
 
 impl EnhanceSettings {
-    /// A profile by name: built-in, then custom; an unknown name falls back to Enhanced.
+    /// A profile by name: built-in, then custom; an unknown name (e.g. a removed profile) falls back to the default.
     pub fn find(&self, name: &str) -> Profile {
-        builtins().into_iter().chain(self.custom.iter().cloned()).find(|p| p.name == name).unwrap_or_else(enhanced)
+        builtins().into_iter().chain(self.custom.iter().cloned()).find(|p| p.name == name).unwrap_or_else(enhanced_vibrant)
     }
     pub fn names(&self) -> Vec<String> {
         builtins().into_iter().map(|p| p.name).chain(self.custom.iter().map(|p| p.name.clone())).collect()
@@ -1192,7 +1202,8 @@ mod tests {
     fn profiles_resolve_by_name_and_unknown_names_fall_back() {
         let mut s = EnhanceSettings::default();
         assert_eq!(s.find(ULTRA).name, ULTRA);
-        assert_eq!(s.find("nope").name, ENHANCED);
+        assert_eq!(s.find("nope").name, DEFAULT_PROFILE);
+        assert_eq!(s.find("Wind Waker Ultra Sharp ++").name, ENHANCED_VIBRANT, "the removed profile falls back to the default");
         let mut c = ultra();
         c.name = s.unique_name("Mine");
         s.custom.push(c);
@@ -1205,32 +1216,54 @@ mod tests {
         assert!(e.sharpen.edge_protection && e.sharpen.halo_suppression);
         assert_eq!((e.colour.saturation, e.colour.vibrance, e.colour.contrast, e.colour.gamma), (0.07, 0.05, 0.03, 1.0));
         assert!(e.colour.protect_highlights && e.colour.protect_shadows);
-        assert_eq!(EnhanceSettings::default().profile, ENHANCED);
+        assert_eq!(EnhanceSettings::default().profile, ENHANCED_VIBRANT);
+        assert_eq!(DEFAULT_PROFILE, ENHANCED_VIBRANT);
     }
 
     #[test]
-    fn the_ultra_profiles_get_stronger_in_order_and_keep_their_safeguards() {
-        let chain = [ultra(), ultra_plus(), ultra_plus_plus()];
-        for w in chain.windows(2) {
-            let (a, b) = (&w[0], &w[1]);
-            assert!(b.sharpen.amount > a.sharpen.amount && b.sharpen.radius > a.sharpen.radius, "{} → {}", a.name, b.name);
-            assert!(b.detail.amount > a.detail.amount && b.sharpen.threshold <= a.sharpen.threshold);
-            assert!(b.sharpen.halo_margin >= a.sharpen.halo_margin);
-        }
-        for p in &chain {
-            assert!(p.sharpen.halo_suppression && p.colour.protect_highlights && p.colour.protect_shadows, "{}", p.name);
-            assert!(is_builtin(&p.name));
-        }
-        // Measured: each step is sharper on a soft painted texture, and alpha stays untouched.
+    fn ultra_sharp_plus_is_stronger_than_ultra_sharp_and_keeps_its_safeguards() {
+        let (a, b) = (ultra(), ultra_plus());
+        assert!(b.sharpen.amount > a.sharpen.amount && b.sharpen.radius > a.sharpen.radius && b.detail.amount > a.detail.amount);
+        assert!(b.sharpen.halo_margin > a.sharpen.halo_margin);
         let img = art(64, 64, true);
-        let sharp = |p: &Profile| {
+        let measure = |p: &Profile| {
             let r = resolve(p, &EnhanceSettings::default(), &target(Class::Rock), &img).unwrap();
             let (out, _) = apply(64, 64, &img, &r, None);
-            assert!(out.chunks_exact(4).zip(img.chunks_exact(4)).all(|(a, b)| a[3] == b[3]));
-            crate::quality::sharpness(64, 64, &out)
+            assert!(out.chunks_exact(4).zip(img.chunks_exact(4)).all(|(x, y)| x[3] == y[3]), "{}", p.name);
+            (crate::quality::sharpness(64, 64, &out), crate::quality::mean_chroma(&out))
         };
-        let s: Vec<f32> = chain.iter().map(sharp).collect();
-        assert!(s[0] < s[1] && s[1] < s[2], "{s:?}");
+        let (sa, _) = measure(&a);
+        let (sb, _) = measure(&b);
+        assert!(sb > sa, "{sa} vs {sb}");
+        for p in [&a, &b, &ultra_vibrant()] {
+            assert!(p.sharpen.halo_suppression && p.colour.protect_highlights && p.colour.protect_shadows && is_builtin(&p.name));
+        }
+    }
+
+    #[test]
+    fn ultra_vibrant_is_ultra_sharp_with_stronger_colour() {
+        let (u, v) = (ultra(), ultra_vibrant());
+        assert_eq!((v.sharpen, v.detail, v.sharp_mips, v.per_class), (u.sharpen, u.detail, u.sharp_mips, u.per_class));
+        assert!(v.colour.vibrance > u.colour.vibrance && v.colour.saturation > u.colour.saturation && v.colour.contrast > u.colour.contrast);
+        let img = art(64, 64, false);
+        let chroma = |p: &Profile, c: Class| {
+            let r = resolve(p, &EnhanceSettings::default(), &target(c), &img).unwrap();
+            crate::quality::mean_chroma(&apply(64, 64, &img, &r, None).0)
+        };
+        assert!(chroma(&v, Class::Rock) > chroma(&u, Class::Rock));
+        // UI colours stay exact even here.
+        assert!(resolve(&v, &EnhanceSettings::default(), &target(Class::Ui), &img).unwrap().colour.is_none());
+        assert!(!is_builtin("Wind Waker Ultra Sharp ++"));
+    }
+
+    #[test]
+    fn enhanced_extra_vibrant_is_enhanced_with_colour_between_ultra_and_ultra_vibrant() {
+        let (e, x, u, v) = (enhanced(), enhanced_vibrant(), ultra(), ultra_vibrant());
+        assert_eq!((x.sharpen, x.detail, x.sharp_mips, x.per_class), (e.sharpen, e.detail, e.sharp_mips, e.per_class));
+        for (a, b, c) in [(u.colour.vibrance, x.colour.vibrance, v.colour.vibrance), (u.colour.saturation, x.colour.saturation, v.colour.saturation), (u.colour.contrast, x.colour.contrast, v.colour.contrast)] {
+            assert!(a < b && b < c, "{a} < {b} < {c}");
+        }
+        assert!(is_builtin(&x.name) && x.colour.protect_highlights && x.colour.protect_shadows);
     }
 
     #[test]

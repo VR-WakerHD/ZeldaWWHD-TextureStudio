@@ -209,7 +209,7 @@ impl EnhanceUi {
             left: Source::Upscaled,
             right: Source::Enhanced,
             variants: VariantSet::Stages,
-            edit: enhance::ENHANCED.into(),
+            edit: enhance::DEFAULT_PROFILE.into(),
             message: String::new(),
         }
     }
@@ -385,7 +385,7 @@ impl App {
             if ui.add_enabled(!builtin, egui::Button::new("Delete")).clicked() {
                 s.custom.retain(|p| p.name != self.enh.edit);
                 if s.profile == self.enh.edit {
-                    s.profile = enhance::ENHANCED.into();
+                    s.profile = enhance::DEFAULT_PROFILE.into();
                 }
                 self.enh.edit = s.profile.clone();
                 changed = true;

@@ -176,7 +176,7 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
             let (root, rule) = resolve_mods_root(a.get("--mods-root").map(PathBuf::from), &s, &Env::from_process())?;
             println!("mods folder: {} ({})", root.display(), rule.label());
             let kind = InstallKind::parse(a.get("--kind").as_deref().unwrap_or("archives"))?;
-            let done = install(&project, &root, !a.flag("--no-enable"), kind)?;
+            let done = install(&project, &root, !a.flag("--no-enable"), kind, &prog)?;
             println!("installed: {:?}", done.ids);
             for w in &done.warnings {
                 println!("warning: {w}");
@@ -418,7 +418,7 @@ pub struct Installed {
 /// Copy this project's packages of `kind` into `<mods_root>/Mods/<id>` and, when `enable`, switch them on in the
 /// active profile of `<mods_root>/profiles.json`. Packages of the other kind are left as they are; when `enable`
 /// finds both kinds switched on it warns, because the two replace the same textures in different ways.
-pub fn install(p: &Project, mods_root: &Path, enable: bool, kind: InstallKind) -> Result<Installed> {
+pub fn install(p: &Project, mods_root: &Path, enable: bool, kind: InstallKind, progress: &Progress) -> Result<Installed> {
     let src = kind.source(p);
     let none = |why: String| wwhd_tex::Error::Format(format!("no packages in {} ({why}); export first", src.display()));
     let mut ids = Vec::new();
@@ -440,9 +440,22 @@ pub fn install(p: &Project, mods_root: &Path, enable: bool, kind: InstallKind) -
             std::fs::remove_dir_all(e.path())?;
         }
     }
+    // One progress step per file. A failed or cancelled copy removes the packages it started, so the game never
+    // loads a half-copied pack.
+    let total: usize = ids.iter().map(|id| count_files(&src.join(id))).sum();
+    progress.begin("Installing", total);
     for id in &ids {
-        copy_dir(&src.join(id), &mods.join(id))?;
+        if let Err(e) = copy_dir(&src.join(id), &mods.join(id), progress) {
+            for id in &ids {
+                let _ = std::fs::remove_dir_all(mods.join(id));
+            }
+            if matches!(e, wwhd_tex::Error::Cancelled) {
+                progress.log("Install cancelled: the partly copied packages were removed".into());
+            }
+            return Err(e);
+        }
     }
+    progress.log(format!("Installed {} file(s) in {} package(s)", total, ids.len()));
     let mut warnings = Vec::new();
     if enable {
         let path = mods_root.join("profiles.json");
@@ -472,16 +485,28 @@ pub fn install(p: &Project, mods_root: &Path, enable: bool, kind: InstallKind) -
     Ok(Installed { ids, warnings })
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+fn count_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| if e.path().is_dir() { count_files(&e.path()) } else { 1 }).sum()
+}
+
+fn copy_dir(from: &Path, to: &Path, progress: &Progress) -> Result<()> {
     std::fs::create_dir_all(to)?;
     for e in std::fs::read_dir(from)?.flatten() {
         let (src, dst) = (e.path(), to.join(e.file_name()));
         if src.is_dir() {
-            copy_dir(&src, &dst)?;
-        } else if std::fs::hard_link(&src, &dst).is_err() {
+            copy_dir(&src, &dst, progress)?;
+            continue;
+        }
+        if progress.cancelled() {
+            return Err(wwhd_tex::Error::Cancelled);
+        }
+        progress.wait_if_paused();
+        progress.item(&e.file_name().to_string_lossy());
+        if std::fs::hard_link(&src, &dst).is_err() {
             // Different drive or no hard-link support: copy instead.
             std::fs::copy(&src, &dst)?;
         }
+        progress.step();
     }
     Ok(())
 }
@@ -544,11 +569,32 @@ mod tests {
     }
 
     #[test]
+    fn install_reports_one_progress_step_per_file() {
+        let (root, p, mods) = rig("progress", serde_json::json!({}));
+        let prog = Progress::default();
+        install(&p, &mods, true, InstallKind::Runtime, &prog).unwrap();
+        let snap = prog.snapshot();
+        assert_eq!((snap.stage.as_str(), snap.done, snap.total), ("Installing", 3, 3), "manifest, index and one DDS");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_cancelled_install_leaves_no_partial_pack_and_enables_nothing() {
+        let (root, p, mods) = rig("cancel", serde_json::json!({"other-mod": true}));
+        let prog = Progress::default();
+        prog.cancel();
+        assert!(matches!(install(&p, &mods, true, InstallKind::Runtime, &prog), Err(wwhd_tex::Error::Cancelled)));
+        assert!(!mods.join("Mods/wwhd-texture-studio-tex-1").exists(), "partly copied pack removed");
+        assert_eq!(enabled(&mods), serde_json::json!({"other-mod": true}), "profiles.json untouched");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runtime_install_copies_and_enables_texture_packs_and_leaves_archive_packs_alone() {
         let (root, p, mods) = rig("runtime", serde_json::json!({"other-mod": true}));
         std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-1")).unwrap();
         std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-tex-9")).unwrap(); // stale: removed
-        let done = install(&p, &mods, true, InstallKind::Runtime).unwrap();
+        let done = install(&p, &mods, true, InstallKind::Runtime, &Progress::default()).unwrap();
         assert_eq!(done.ids, ["wwhd-texture-studio-tex-1"]);
         assert!(done.warnings.is_empty(), "{:?}", done.warnings);
         assert_eq!(std::fs::read(mods.join("Mods/wwhd-texture-studio-tex-1/textures/ab/abcd.dds")).unwrap(), b"dds");
@@ -561,12 +607,12 @@ mod tests {
     #[test]
     fn runtime_install_warns_when_archive_packs_are_enabled() {
         let (root, p, mods) = rig("warn-runtime", serde_json::json!({"wwhd-texture-studio-1": true}));
-        let done = install(&p, &mods, true, InstallKind::Runtime).unwrap();
+        let done = install(&p, &mods, true, InstallKind::Runtime, &Progress::default()).unwrap();
         assert_eq!(done.warnings.len(), 1);
         assert!(done.warnings[0].contains("rebuilt-archive") && done.warnings[0].contains("wwhd-texture-studio-1"), "{:?}", done.warnings);
         // an archive pack that is installed but switched off is no conflict
         let (root2, p2, mods2) = rig("no-warn", serde_json::json!({"wwhd-texture-studio-1": false}));
-        assert!(install(&p2, &mods2, true, InstallKind::Runtime).unwrap().warnings.is_empty());
+        assert!(install(&p2, &mods2, true, InstallKind::Runtime, &Progress::default()).unwrap().warnings.is_empty());
         let _ = (std::fs::remove_dir_all(root), std::fs::remove_dir_all(root2));
     }
 
@@ -574,7 +620,7 @@ mod tests {
     fn archive_install_warns_when_runtime_packs_are_enabled_and_keeps_them() {
         let (root, p, mods) = rig("warn-archives", serde_json::json!({"wwhd-texture-studio-tex-1": true}));
         std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-tex-1")).unwrap();
-        let done = install(&p, &mods, true, InstallKind::Archives).unwrap();
+        let done = install(&p, &mods, true, InstallKind::Archives, &Progress::default()).unwrap();
         assert_eq!(done.ids, ["wwhd-texture-studio-1"]);
         assert_eq!(done.warnings.len(), 1);
         assert!(done.warnings[0].contains("runtime texture packs"), "{:?}", done.warnings);
@@ -588,7 +634,7 @@ mod tests {
         let (root, p, mods) = rig("empty", serde_json::json!({}));
         std::fs::remove_dir_all(p.runtime_dir()).unwrap();
         std::fs::create_dir_all(mods.join("Mods/wwhd-texture-studio-tex-1")).unwrap();
-        assert!(install(&p, &mods, true, InstallKind::Runtime).is_err());
+        assert!(install(&p, &mods, true, InstallKind::Runtime, &Progress::default()).is_err());
         assert!(mods.join("Mods/wwhd-texture-studio-tex-1").exists());
         assert!(InstallKind::parse("runtime").is_ok() && InstallKind::parse("both").is_err());
         let _ = std::fs::remove_dir_all(root);

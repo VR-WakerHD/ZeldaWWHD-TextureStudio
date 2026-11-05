@@ -531,8 +531,8 @@ impl App {
         self.install_confirm = false;
         self.create_confirm = None;
         self.install_warnings.clear();
-        self.spawn("Installing", move |_, tx| {
-            let done = cli::install(&p, &root, true, kind)?;
+        self.spawn("Installing", move |prog, tx| {
+            let done = cli::install(&p, &root, true, kind, prog)?;
             let _ = tx.send(Msg::Installed(done.ids.clone(), done.warnings.clone()));
             Ok(format!("Installed {} package(s); start the game to use them. {}", done.ids.len(), done.warnings.join(" ")))
         });

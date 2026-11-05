@@ -127,7 +127,8 @@ pub fn run(p: &Project, s: &Settings, d: &Decisions, names: Option<Vec<String>>,
         ("Original profile".into(), profiles[0].clone()),
         ("Ultra Sharp profile".into(), profiles[2].clone()),
         ("Ultra Sharp + profile".into(), profiles[3].clone()),
-        ("Ultra Sharp ++ profile".into(), profiles[4].clone()),
+        ("Ultra Sharp & Ultra Vibrant profile".into(), profiles[4].clone()),
+        ("Enhanced & Extra Vibrant profile".into(), profiles[5].clone()),
     ];
     let other_models: Vec<BackendChoice> = upscale::catalogue().into_iter().filter(|b| b.is_ai() && b.key() != backend_key).collect();
 

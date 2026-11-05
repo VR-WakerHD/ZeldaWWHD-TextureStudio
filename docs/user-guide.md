@@ -37,7 +37,7 @@ its own rebuilt copy.
 - **Compare models**: runs the ticked models on the selected texture and shows them side by side; clicking a
   result makes that model the choice for this texture.
 - **Enhance**: post-upscale sharpening, detail recovery and colour (see `docs/enhancement.md`). Left: the project's
-  profile (Original, **Enhanced** by default, Ultra Sharp, or your own), duplicate / reset / delete / save / load
+  profile (Original, Enhanced, **Enhanced & Extra Vibrant** by default, Ultra Sharp, Ultra Sharp +, Ultra Sharp & Ultra Vibrant, or your own), duplicate / reset / delete / save / load
   of custom profiles, and every parameter. Right: the texture selected in Assets, with its own profile choice,
   suggested models for its class, and a comparison viewer (split with a movable divider, side by side, or variant
   grids of stages, profiles, sharpening and colour strengths, or models). Wheel zooms, drag pans, **Fit** and

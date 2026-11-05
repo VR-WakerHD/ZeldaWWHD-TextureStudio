@@ -41,23 +41,29 @@ does the same for darkening over the bottom 10 %. Both apply to the total change
 
 ## Stages and defaults
 
-| Parameter | Original | **Enhanced (default)** | Ultra Sharp | Ultra Sharp + | Ultra Sharp ++ |
-|---|---:|---:|---:|---:|---:|
-| Unsharp mask radius (source texels) | 0.6 | **0.6** | 0.7 | 0.8 | 1.0 |
-| Sharpening amount | 25 % | **55 %** | 85 % | 120 % | 170 % |
-| Threshold (8-bit levels) | 3 | **2** | 2 | 1.5 | 1.5 |
-| Edge protection / halo suppression / adaptive | on | **on** | on | on | on |
-| Halo margin (8-bit levels) | 1 | **1** | 1 | 3 | 3 |
-| Detail recovery (local contrast) | off | **30 %** | 55 % | 80 % | 110 % |
-| Detail size (source texels) / edge level | — | **0.75 / 0.05** | 0.75 / 0.05 | 0.75 / 0.05 | 0.75 / 0.05 |
-| Texture restoration | off | **0 %** | 15 % | 20 % | 25 % |
-| Saturation | 0 | **+7 %** | +8 % | +8 % | +8 % |
-| Vibrance | 0 | **+5 %** | +8 % | +8 % | +10 % |
-| Contrast | 0 | **+3 %** | +4 % | +4 % | +5 % |
-| Gamma | 1.0 | **1.0** | 1.0 | 1.0 | 1.0 |
-| Highlight / shadow protection | on | **on** | on | on | on |
-| Per-class tuning | on | **on** | on | on | on |
-| Sharper mips (Catmull-Rom) | off | **on** | on | on | on |
+| Parameter | Original | Enhanced | **Enhanced & Extra Vibrant (default)** | Ultra Sharp | Ultra Sharp + | Ultra Sharp & Ultra Vibrant |
+|---|---:|---:|---:|---:|---:|---:|
+| Unsharp mask radius (source texels) | 0.6 | 0.6 | **0.6** | 0.7 | 0.8 | 0.7 |
+| Sharpening amount | 25 % | 55 % | **55 %** | 85 % | 120 % | 85 % |
+| Threshold (8-bit levels) | 3 | 2 | **2** | 2 | 1.5 | 2 |
+| Edge protection / halo suppression / adaptive | on | on | **on** | on | on | on |
+| Halo margin (8-bit levels) | 1 | 1 | **1** | 1 | 3 | 1 |
+| Detail recovery (local contrast) | off | 30 % | **30 %** | 55 % | 80 % | 55 % |
+| Detail size (source texels) / edge level | — | 0.75 / 0.05 | **0.75 / 0.05** | 0.75 / 0.05 | 0.75 / 0.05 | 0.75 / 0.05 |
+| Texture restoration | off | 0 % | **0 %** | 15 % | 20 % | 15 % |
+| Vibrance | 0 | +5 % | **+18 %** | +8 % | +8 % | +25 % |
+| Saturation | 0 | +7 % | **+10 %** | +8 % | +8 % | +12 % |
+| Contrast | 0 | +3 % | **+5 %** | +4 % | +4 % | +6 % |
+| Gamma | 1.0 | 1.0 | **1.0** | 1.0 | 1.0 | 1.0 |
+| Highlight / shadow protection | on | on | **on** | on | on | on |
+| Per-class tuning | on | on | **on** | on | on | on |
+| Sharper mips (Catmull-Rom) | off | on | **on** | on | on | on |
+
+The defaults in the original specification (sharpen 55 %, radius 0.6, threshold 2; saturation +7 %, vibrance +5 %,
+contrast +3 %) are the **Enhanced** profile. **Enhanced & Extra Vibrant** keeps its sharpening and detail and
+strengthens the colour. It became the default on 2026-11-04 after side-by-side comparisons on 15 textures. Projects
+whose `settings.json` already names a profile keep it; a name that no longer exists (such as the removed Ultra
+Sharp ++) falls back to the default.
 
 **Radius unit.** The radius counts *source texels* by default, so ×4 output is sharpened with a 2.4 px sigma. In
 output pixels, 0.6 px on a ×4 texture is a quarter of a painted texel: the benchmark measured +3 % sharpness, and
@@ -74,12 +80,27 @@ unenhanced image, plus the profile's *halo margin* (1 level by default; 3 in Ult
 this clamp, a 2.4 px sigma produced visible light rims along dark outlines (halo measure 9 %). With it, the measure
 is 0.03 % for sharpening alone.
 
-**Ultra Sharp + and ++.** Once an edge is fully steepened inside its neighbourhood's range, more strength changes
-nothing, so these two also allow a 3-level overshoot (acutance). Measured on 7 textures against the AI upscale:
-Ultra Sharp +8 % to +99 % sharper, Ultra Sharp ++ +10 % to +142 % (water lowest, roofs and stone highest). A 6- or
-4-level margin, or edge protection off, put light rims around dark shapes; a threshold of 1 turned the AI's faint
-noise into grain. Both are tuned below those points, but at 100 % zoom they look processed: check them in the
-headset, where distant surfaces are seen through mips.
+**Ultra Sharp +.** Once an edge is fully steepened inside its neighbourhood's range, more strength changes nothing,
+so this profile also allows a 3-level overshoot (acutance). Measured on 13 textures against the AI upscale, it is
++8 % to +104 % sharper (water lowest, roofs, wood and stone highest). An even stronger profile (Ultra Sharp ++,
+170 %, radius 1.0) was tried and removed. A 6- or 4-level margin, or edge protection off, put light rims around
+dark shapes, and a threshold of 1 turned the AI's faint noise into grain. At 100 % zoom Ultra Sharp + looks
+processed, so check it in the headset, where distant surfaces are seen through mips.
+
+**Vibrant profiles.** Vibrance does most of the work: muted colours gain most, already-saturated ones little. Colour
+change against the AI upscale (Hasler–Süsstrunk colourfulness) for Enhanced → Enhanced & Extra Vibrant → Ultra
+Sharp & Ultra Vibrant:
+
+| Texture | Enhanced | Enhanced & Extra Vibrant | Ultra Sharp & Ultra Vibrant |
+|---|---:|---:|---:|
+| Txq_hs07_jimen_kusa (grass) | +16 % | +34 % | +42 % |
+| B_StreamSand (ground) | +15 % | +29 % | +43 % |
+| Txi_yane2 (roof) | +7 % | +28 % | +38 % |
+| nagare (water, ×0.6 colour tuning) | +9 % | +20 % | +25 % |
+| tc_body (Link's tunic, already saturated) | 0 % | +2 % | +3 % |
+
+Fidelity to the original (SSIM after reducing to the source size) is within 0.004 of the same-sharpness profile
+without the extra colour. UI colours never change.
 
 **Detail recovery** is a self-guided filter on lightness. Regions whose local contrast is below the edge level count
 as painted texture and are lifted; edges above it are left alone. *Texture restoration* puts back the original's own
@@ -109,7 +130,7 @@ gives every colour texture the same strengths (UI colour stays unchanged).
 
 ## Profiles
 
-Wind Waker Original, Enhanced (the default), Ultra Sharp, Ultra Sharp + and Ultra Sharp ++ are built in and fixed. In **Enhance**: *Duplicate*
+Wind Waker Original, Enhanced, **Enhanced & Extra Vibrant** (the default), Ultra Sharp, Ultra Sharp + and Ultra Sharp & Ultra Vibrant are built in and fixed. In **Enhance**: *Duplicate*
 makes an editable custom profile; the name field renames it; *Reset to Enhanced* restores defaults and keeps the
 name; *Delete* removes it; *Save to file… / Load from file…* exchange profiles as JSON. Custom profiles live in the
 project's `settings.json` (`enhance.custom`). Each texture can pick its own profile (stored in
