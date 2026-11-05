@@ -331,12 +331,7 @@ fn profile_editor(ui: &mut egui::Ui, p: &mut Profile) -> bool {
     ui.separator();
     ui.label(RichText::new("Clean-up").strong());
     ch |= pct(ui, &mut p.cleanup.dering, 0.0..=1.0, "halo removal", "Removes the bright and dark rims upscalers add along strong edges: lightness stays within the original's local range. Detail inside that range is kept");
-    ch |= ui.checkbox(&mut p.cleanup.crisp_cutouts, "Crisp cut-out edges").on_hover_text("Cut-out textures (leaves, fences, grates) get their alpha rebuilt from the original: same outline, 1-2 pixel edge instead of a soft blur. Blended transparency is left alone").changed();
-    ui.add_enabled_ui(p.cleanup.crisp_cutouts, |ui| {
-        ch |= slider(ui, &mut p.cleanup.edge_width, 0.5..=4.0, "edge width (px)", "Width of the anti-aliased cut-out edge in output pixels. Under 1 = razor sharp but can shimmer in VR when you move; 1.5-2.5 = crisp and steadier");
-        ch |= slider(ui, &mut p.cleanup.edge_smoothing, 0.0..=1.0, "edge smoothing (texels)", "Irons out the original's pixel staircase on diagonal edges. Too much rounds corners and thins grass blades");
-        ch |= ui.checkbox(&mut p.cleanup.edge_follow_colour, "Follow colour edges").on_hover_text("Snaps the cut-out edge to the edge in the upscaled colour, so silhouettes line up with the painted outline").changed();
-    });
+    ui.label(RichText::new("Cut-out edges are set for all profiles by Cut-out edges at the top.").weak());
     ui.separator();
     ch |= ui.checkbox(&mut p.per_class, "Tune per texture class").on_hover_text("Strengths scaled per class: e.g. water and sky sharpened less, stone more, UI colours never changed. Low-confidence classes get 60 %").changed();
     ch |= ui.checkbox(&mut p.sharp_mips, "Sharper mips (Catmull-Rom)").on_hover_text("Distant mip levels reduced with Catmull-Rom instead of a 2×2 box: crisper at a distance").changed();
@@ -652,7 +647,6 @@ impl App {
                     VariantSet::Colour => [0.0, 0.5, 1.0, 1.5, 2.0].iter().map(|k| (format!("colour ×{k}"), mk(Some(&enhance::with_colour_strength(&base, *k)), false, &png))).collect(),
                     VariantSet::CutoutEdges => enhance::CutoutChoice::ALL
                         .iter()
-                        .filter(|c| **c != enhance::CutoutChoice::FromProfile)
                         .map(|c| {
                             let mut st = settings.clone();
                             st.cutout_edges = *c;

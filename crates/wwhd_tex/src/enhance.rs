@@ -338,44 +338,51 @@ pub struct EnhanceSettings {
     /// filtering in the game cannot pull dark or bright fringes into edges. Off by default: in some textures the
     /// alpha channel is not coverage, and there the hidden colour is visible.
     pub fill_transparent: bool,
-    /// Cut-out edge choice for the whole project, whatever the profile (`FromProfile` = the profile's own setting).
+    /// Cut-out edge choice for every texture and every profile (default 1.5 px + smoothing).
     pub cutout_edges: CutoutChoice,
 }
 
 impl Default for EnhanceSettings {
     fn default() -> Self {
-        EnhanceSettings { enabled: true, profile: DEFAULT_PROFILE.into(), custom: Vec::new(), fill_transparent: false, cutout_edges: CutoutChoice::FromProfile }
+        EnhanceSettings { enabled: true, profile: DEFAULT_PROFILE.into(), custom: Vec::new(), fill_transparent: false, cutout_edges: CutoutChoice::Smooth15 }
     }
 }
 
-/// The cut-out edge options the user can pick (the variants compared on 2026-11-04), or the profile's own setting.
+/// The cut-out edge options the user can pick (the variants compared on 2026-11-04). It decides the cut-out edges for
+/// every profile; the profiles' own edge fields are no longer used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CutoutChoice {
-    FromProfile,
+    /// 1.5 px + smoothing, the default (a saved "FromProfile" from older builds reads as this).
+    #[serde(alias = "FromProfile")]
+    Smooth15,
     /// The soft enlarged edge, as before crisp edges existed.
     Soft,
     Crisp08,
     Crisp15,
     Crisp25,
-    Smooth15,
     Follow15,
     SmoothFollow15,
 }
 
+impl Default for CutoutChoice {
+    fn default() -> Self {
+        CutoutChoice::Smooth15
+    }
+}
+
 impl CutoutChoice {
-    pub const ALL: [CutoutChoice; 8] = [
-        CutoutChoice::FromProfile,
+    /// In menu order: the default first.
+    pub const ALL: [CutoutChoice; 7] = [
+        CutoutChoice::Smooth15,
         CutoutChoice::Soft,
         CutoutChoice::Crisp08,
         CutoutChoice::Crisp15,
         CutoutChoice::Crisp25,
-        CutoutChoice::Smooth15,
         CutoutChoice::Follow15,
         CutoutChoice::SmoothFollow15,
     ];
     pub fn label(self) -> &'static str {
         match self {
-            CutoutChoice::FromProfile => "As the profile sets it",
             CutoutChoice::Soft => "Soft (no crisp edges)",
             CutoutChoice::Crisp08 => "Crisp 0.8 px (razor sharp)",
             CutoutChoice::Crisp15 => "Crisp 1.5 px",
@@ -387,7 +394,6 @@ impl CutoutChoice {
     }
     pub fn hint(self) -> &'static str {
         match self {
-            CutoutChoice::FromProfile => "Each profile's own cut-out edge setting (built-ins: 1.5 px + smoothing)",
             CutoutChoice::Soft => "The enlarged edge, about 8 px of blur at x4: no stair-steps, but soft up close",
             CutoutChoice::Crisp08 => "Sharpest; keeps the original's pixel staircase and can shimmer in VR as you move",
             CutoutChoice::Crisp15 => "Crisp and steadier than 0.8 px; the staircase is still visible on curves",
@@ -397,12 +403,11 @@ impl CutoutChoice {
             CutoutChoice::SmoothFollow15 => "Smoothed outline that then snaps to the painted colour edge",
         }
     }
-    /// The clean-up settings this choice stands for, applied over `base` (`None` = keep the profile's).
+    /// The clean-up settings this choice stands for: `base`'s halo removal, with this choice's cut-out edges.
     pub fn apply(self, base: &Cleanup) -> Cleanup {
         let c = |crisp: bool, width: f32, smoothing: f32, follow: bool| Cleanup { crisp_cutouts: crisp, edge_width: width, edge_smoothing: smoothing, edge_follow_colour: follow, ..*base };
         match self {
-            CutoutChoice::FromProfile => *base,
-            CutoutChoice::Soft => c(false, base.edge_width, base.edge_smoothing, base.edge_follow_colour),
+            CutoutChoice::Soft => c(false, 1.5, 0.0, false),
             CutoutChoice::Crisp08 => c(true, 0.8, 0.0, false),
             CutoutChoice::Crisp15 => c(true, 1.5, 0.0, false),
             CutoutChoice::Crisp25 => c(true, 2.5, 0.0, false),
@@ -1218,8 +1223,9 @@ mod tests {
         p.sharpen.enabled = false;
         p.detail.enabled = false;
         p.colour.enabled = false;
-        p.cleanup = Cleanup { dering: 0.0, crisp_cutouts: false, ..Cleanup::default() };
-        let r = resolve(&p, &EnhanceSettings::default(), &target(Class::Rock), &img).unwrap();
+        p.cleanup = Cleanup { dering: 0.0, ..Cleanup::default() };
+        let soft = EnhanceSettings { cutout_edges: CutoutChoice::Soft, ..EnhanceSettings::default() };
+        let r = resolve(&p, &soft, &target(Class::Rock), &img).unwrap();
         assert!(r.is_noop());
         assert_eq!(apply(64, 64, &img, &r, None).0, img);
     }
@@ -1238,9 +1244,9 @@ mod tests {
     #[test]
     fn alpha_is_never_changed_and_hidden_colour_stays() {
         let img = art(64, 64, true);
-        for mut prof in builtins() {
-            prof.cleanup.crisp_cutouts = false;
-            let r = resolve(&prof, &EnhanceSettings::default(), &target(Class::Foliage), &img).unwrap();
+        for prof in builtins() {
+            let soft = EnhanceSettings { cutout_edges: CutoutChoice::Soft, ..EnhanceSettings::default() };
+            let r = resolve(&prof, &soft, &target(Class::Foliage), &img).unwrap();
             let (out, _) = apply(64, 64, &img, &r, Some((16, 16, &art(16, 16, true))));
             for (a, b) in out.chunks_exact(4).zip(img.chunks_exact(4)) {
                 assert_eq!(a[3], b[3], "{}", prof.name);
@@ -1554,8 +1560,10 @@ mod tests {
             let r = resolve_with(CutoutChoice::Crisp25, &p);
             assert!(r.crisp_cutouts && r.cutout.width == 2.5 && r.cutout.smoothing == 0.0, "{}", p.name);
             assert!(!resolve_with(CutoutChoice::Soft, &p).crisp_cutouts, "{}", p.name);
-            let own = resolve_with(CutoutChoice::FromProfile, &p);
-            assert_eq!((own.cutout.width, own.cutout.smoothing), (p.cleanup.edge_width, p.cleanup.edge_smoothing));
+            let mut odd = p.clone();
+            odd.cleanup = Cleanup { crisp_cutouts: false, edge_width: 3.5, edge_smoothing: 0.0, edge_follow_colour: true, ..p.cleanup };
+            let picked = resolve_with(CutoutChoice::Smooth15, &odd);
+            assert!(picked.crisp_cutouts && picked.cutout == CutoutEdge { width: 1.5, smoothing: 0.5, follow_colour: false }, "the profile's own edge fields are ignored");
             let both = resolve_with(CutoutChoice::SmoothFollow15, &p);
             assert!(both.cutout.follow_colour && both.cutout.smoothing == 0.5);
         }
@@ -1568,6 +1576,10 @@ mod tests {
 
     #[test]
     fn the_default_cutout_edge_is_1_5_px_with_mild_smoothing() {
+        assert_eq!(EnhanceSettings::default().cutout_edges, CutoutChoice::Smooth15);
+        assert_eq!(CutoutChoice::ALL[0], CutoutChoice::Smooth15, "first in the menu");
+        let old: EnhanceSettings = serde_json::from_str(r#"{"cutout_edges":"FromProfile"}"#).unwrap();
+        assert_eq!(old.cutout_edges, CutoutChoice::Smooth15);
         let c = Cleanup::default();
         assert_eq!((c.edge_width, c.edge_smoothing, c.edge_follow_colour), (1.5, 0.5, false));
         assert!(c.crisp_cutouts);
@@ -1583,8 +1595,9 @@ mod tests {
             p.sharpen.enabled = false;
             p.detail.enabled = false;
             p.colour.enabled = false;
-            p.cleanup = Cleanup { dering: 0.0, edge_width: width, edge_smoothing: smoothing, ..Cleanup::default() };
-            let r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Foliage) }, &soft).unwrap();
+            p.cleanup.dering = 0.0;
+            let mut r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Foliage) }, &soft).unwrap();
+            r.cutout = CutoutEdge { width, smoothing, follow_colour: false };
             apply(n * sc, n * sc, &soft, &r, Some((n, n, &src))).0
         };
         let partial = |d: &[u8]| d.chunks_exact(4).filter(|p| p[3] > 16 && p[3] < 240).count();
@@ -1610,8 +1623,9 @@ mod tests {
             p.sharpen.enabled = false;
             p.detail.enabled = false;
             p.colour.enabled = false;
-            p.cleanup = Cleanup { dering: 0.0, edge_follow_colour: follow, ..Cleanup::default() };
-            let r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Foliage) }, &up).unwrap();
+            p.cleanup.dering = 0.0;
+            let mut r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Foliage) }, &up).unwrap();
+            r.cutout = CutoutEdge { width: 0.8, smoothing: 0.0, follow_colour: follow };
             apply(w, w, &up, &r, Some((n, n, &src))).0
         };
         let (plain, guided) = (contour(&run(false)), contour(&run(true)));
