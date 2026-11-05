@@ -74,7 +74,7 @@ pub enum Edge {
     Clamp,
 }
 
-fn address(i: i64, n: usize, edge: Edge) -> usize {
+pub(crate) fn address(i: i64, n: usize, edge: Edge) -> usize {
     match edge {
         Edge::Wrap => i.rem_euclid(n as i64) as usize,
         Edge::Clamp => i.clamp(0, n as i64 - 1) as usize,

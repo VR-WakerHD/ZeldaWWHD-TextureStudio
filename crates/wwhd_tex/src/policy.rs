@@ -28,6 +28,9 @@ pub struct Review {
     pub scale: Option<u32>,
     pub rating: u8,
     pub note: String,
+    /// Enhancement profile for this texture (by name); `None` follows the project's profile.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Reviews and manual classifications, keyed by texture content key.

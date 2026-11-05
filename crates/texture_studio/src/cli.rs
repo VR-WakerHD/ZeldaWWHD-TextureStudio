@@ -27,6 +27,10 @@ Without arguments the GUI starts. Commands:
   install  --project DIR [--mods-root DIR] [--kind archives|runtime] [--no-enable]
                                                             copy packages into the recomp's ModManager folder
                                                             (found like the recomp does; --mods-root or Settings override)
+  enhance-bench --project DIR [--names TEXT,TEXT | --per-class N] [--backend KEY] [--scale N] [--crop N] [--max-side N]
+                                                            sheets and metrics: original, AI, AI+sharpen, AI+colour,
+                                                            AI+both, each profile, other cached models
+                                                            (reports/enhance_bench/)
   stats    --project DIR
   install-tools --project DIR [--tools DIR]               download the missing AI upscalers (official releases,
                                                             SHA-256 checked) into the tools folder
@@ -82,7 +86,7 @@ fn console_progress(p: &Project) -> Progress {
     prog
 }
 
-fn load_inventory(p: &Project) -> Result<Inventory> {
+pub(crate) fn load_inventory(p: &Project) -> Result<Inventory> {
     Inventory::load(&p.inventory_path())
         .map_err(|e| wwhd_tex::Error::Format(format!("no inventory yet ({e}); run scan first")))
 }
@@ -162,6 +166,7 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
             print_report(&r);
         }
         "compare" => compare(&project, &s, a, &prog)?,
+        "enhance-bench" => crate::bench::run(&project, &s, &d, a.get("--names").map(|_| a.list("--names")), a.get("--per-class").and_then(|v| v.parse().ok()).unwrap_or(1), a.get("--backend"), a.get("--scale").and_then(|v| v.parse().ok()).unwrap_or(4), a.get("--crop").and_then(|v| v.parse().ok()).unwrap_or(48), a.get("--max-side").and_then(|v| v.parse().ok()).unwrap_or(512))?,
         "install" => {
             let (root, rule) = resolve_mods_root(a.get("--mods-root").map(PathBuf::from), &s, &Env::from_process())?;
             println!("mods folder: {} ({})", root.display(), rule.label());
@@ -327,7 +332,7 @@ fn compare(p: &Project, s: &Settings, a: &Args, prog: &Progress) -> Result<()> {
     Ok(())
 }
 
-fn blit(dst: &mut [u8], dw: u32, x: u32, y: u32, w: u32, h: u32, src: &[u8]) {
+pub(crate) fn blit(dst: &mut [u8], dw: u32, x: u32, y: u32, w: u32, h: u32, src: &[u8]) {
     for r in 0..h {
         for c in 0..w {
             let s = ((r * w + c) * 4) as usize;

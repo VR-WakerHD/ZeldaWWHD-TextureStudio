@@ -14,6 +14,7 @@ use crate::bfres;
 use crate::bflim::Bflim;
 use crate::classify::{self, Class};
 use crate::container::{self, LeafKind};
+use crate::enhance;
 use crate::error::{bail, Error, Result};
 use crate::gx2;
 use crate::inventory::{Inventory, TextureRecord};
@@ -546,7 +547,7 @@ pub struct ExportReport {
     pub guest_growth_bytes: u64,
 }
 
-pub(crate) fn mip_mode(class: Class, format: u32, rgba: &[u8]) -> MipMode {
+pub fn mip_mode(class: Class, format: u32, rgba: &[u8]) -> MipMode {
     let c = gx2::codec(format).ok();
     match class {
         // Decoded SNORM data is unsigned-mapped, see `run_with_recovery`.
@@ -554,6 +555,34 @@ pub(crate) fn mip_mode(class: Class, format: u32, rgba: &[u8]) -> MipMode {
         Class::Mask | Class::Ramp => MipMode::Data,
         _ => MipMode::Colour { srgb: gx2::is_srgb(format), alpha_test: c.map(|c| c.has_alpha()).unwrap_or(false) && mips::is_alpha_tested(rgba) },
     }
+}
+
+/// Edge addressing for a texture: layout images are clamped, 3D textures tile.
+pub fn edge_of(t: &TextureRecord) -> Edge {
+    if t.kind == LeafKind::Bflim { Edge::Clamp } else { Edge::Wrap }
+}
+
+/// The profile and target that decide how texture record `i` is enhanced when made from `png` at `scale`.
+pub fn enhance_inputs(s: &Settings, inv: &Inventory, d: &Decisions, i: usize, png: &Path, scale: u32) -> (enhance::Profile, enhance::Target) {
+    let t = &inv.textures[i];
+    let cl = d.classification(t);
+    let ai = load_meta(png).map(|m| m.used.is_ai()).unwrap_or(false);
+    let profile = s.enhance.profile_for(d.review(&t.key).profile.as_deref());
+    let target = enhance::Target { class: cl.class, confidence: cl.confidence, manual: cl.manual, format: t.surface.format, scale, edge: edge_of(t), ai };
+    (profile, target)
+}
+
+/// Enhance an upscaled level 0 for export: returns the image and the edge to build sharp mips with, if the profile
+/// asks for them. Textures that are not enhanced come back unchanged with `None`.
+pub fn enhance_level0(p: &Project, s: &Settings, inv: &Inventory, i: usize, profile: &enhance::Profile, target: &enhance::Target, w: u32, h: u32, rgba: Vec<u8>) -> (Vec<u8>, Option<Edge>) {
+    let Some(r) = enhance::resolve(profile, &s.enhance, target, &rgba) else { return (rgba, None) };
+    let sharp = r.sharp_mips.then_some(target.edge);
+    if r.is_noop() {
+        return (rgba, sharp);
+    }
+    let original = r.detail.filter(|d| d.restore > 0.0).and_then(|_| load_png(&p.master_path(&inv.textures[i].key)).ok());
+    let (out, _) = enhance::apply(w, h, &rgba, &r, original.as_ref().map(|(ow, oh, o)| (*ow, *oh, &o[..])));
+    (out, sharp)
 }
 
 fn psnr(a: &[u8], b: &[u8]) -> f32 {
@@ -585,11 +614,13 @@ fn build_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, i: usize
     let png_bytes = std::fs::read(&png).map_err(|e| Error::Format(format!("upscaled image missing: {e}")))?;
     // Encoded surfaces are cached by everything that determines them, including
     // the upscaled image's bytes, so shared textures encode once.
+    let (profile, target) = enhance_inputs(s, inv, d, i, &png, scale);
     let mut h = blake3::Hasher::new();
     h.update(b"encode-v1");
     h.update(&png_bytes);
     h.update(t.key.as_bytes());
     h.update(format!("{class:?}{}{}{:?}", scale, s.debug_tint, t.surface).as_bytes());
+    h.update(enhance::cache_tag(&profile, &s.enhance, &target).as_bytes());
     let cache_key = h.finalize().to_hex().to_string();
     let cache_path = p.encoded_path(&cache_key);
     if let Some(hit) = load_encoded(&cache_path, t) {
@@ -597,18 +628,18 @@ fn build_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, i: usize
     }
     let img = image::load_from_memory(&png_bytes).map_err(|e| Error::Format(format!("{}: {e}", png.display())))?.to_rgba8();
     let (w, h) = (img.width(), img.height());
-    let mut rgba = img.into_raw();
+    if (w, h) != (t.surface.width * scale, t.surface.height * scale) {
+        bail!("upscaled image is {w}x{h}, expected x{scale}");
+    }
+    let (mut rgba, sharp) = enhance_level0(p, s, inv, i, &profile, &target, w, h, img.into_raw());
     if s.debug_tint {
         for px in rgba.chunks_exact_mut(4) {
             px[1] /= 3;
         }
     }
-    if (w, h) != (t.surface.width * scale, t.surface.height * scale) {
-        bail!("upscaled image is {w}x{h}, expected x{scale}");
-    }
     let count = mips::upscaled_mip_count(t.surface.mip_count, scale);
     let mode = mip_mode(class, t.surface.format, &rgba);
-    let levels = mips::chain(w, h, rgba, count, mode);
+    let levels = mips::chain_with(w, h, rgba, count, mode, sharp);
     let rep = texture::build_replacement(&info_of(t), &levels)?;
     // Validate: decode what will be written and compare with the intended image.
     let mut check = info_of(t);

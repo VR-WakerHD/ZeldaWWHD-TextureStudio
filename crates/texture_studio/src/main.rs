@@ -1,9 +1,11 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod bench;
 mod cli;
 mod derived;
 mod images;
+mod viewer;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

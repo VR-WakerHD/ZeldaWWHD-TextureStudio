@@ -36,6 +36,13 @@ its own rebuilt copy.
   (side by side, slider, alpha, normal map) with zoom. Batch buttons apply to everything shown.
 - **Compare models**: runs the ticked models on the selected texture and shows them side by side; clicking a
   result makes that model the choice for this texture.
+- **Enhance**: post-upscale sharpening, detail recovery and colour (see `docs/enhancement.md`). Left: the project's
+  profile (Original, **Enhanced** by default, Ultra Sharp, or your own), duplicate / reset / delete / save / load
+  of custom profiles, and every parameter. Right: the texture selected in Assets, with its own profile choice,
+  suggested models for its class, and a comparison viewer (split with a movable divider, side by side, or variant
+  grids of stages, profiles, sharpening and colour strengths, or models). Wheel zooms, drag pans, **Fit** and
+  **100 %**. *As exported* shows the real BC encode. Changing a profile never re-upscales; the next export
+  re-encodes.
 - **Settings**: at the top, **Upscaling models**: which AI upscalers are installed, and **Install Upscaling Models**,
   which downloads the missing ones (Real-ESRGAN, waifu2x, Real-CUGAN, RealSR) from their official GitHub releases,
   checks each against its pinned SHA-256 and unpacks it into the tools folder (progress and Cancel in Queue). Then: scan scope, resolution policy (global scale, max side, "keep native below", and a scale per class
@@ -73,7 +80,9 @@ its own rebuilt copy.
    border (clamped for UI) so tiling textures stay seamless; alpha is resized separately. Each AI result is
    shrunk back and compared with the source; below 22 dB it is discarded and Lanczos-3 is used (noted).
    A failing model run is retried with a smaller tile, then image by image, then with Lanczos-3.
-3. **Export (rebuilt archives)**: mip chain (sRGB-correct, alpha coverage kept for cut-outs, normals renormalised), encode to the
+3. **Enhance** (both exports): the active profile is applied to the cached upscale in memory. Alpha, data textures
+   (normal maps, masks, ramps, one/two-channel formats) and Unknown-class textures are left exactly as they are.
+   **Export (rebuilt archives)**: mip chain (sRGB-correct, alpha coverage kept for cut-outs, normals renormalised), encode to the
    original GX2 format, tile, write into the archive, rebuild SARC/Yaz0, reopen and compare everything. Each
    texture must decode back at ≥ 24 dB of the intended image or the original is kept.
 
@@ -116,6 +125,7 @@ archive so it can be added to the defaults.
 | `export-runtime [--only TEXT,TEXT] [--debug-tint]` | runtime texture packs (`output/runtime`) from the upscales made so far |
 | `run [--disc DIR] [--only …]` | all of the above |
 | `compare --names TEXT,TEXT [--backends all\|KEY,KEY] [--crop N]` | contact sheet of models in `reports/` |
+| `enhance-bench [--per-class N \| --names TEXT,TEXT] [--backend KEY] [--scale N] [--crop N] [--max-side N]` | enhancement QA: sheets and metrics per texture in `reports/enhance_bench/` |
 | `install-tools [--tools DIR]` | download the missing AI upscalers into the tools folder (official releases, SHA-256 checked) |
 | `install [--mods-root DIR] [--kind archives\|runtime] [--no-enable]` | copy the packages of that kind (default `archives`) into the ModManager folder and enable them |
 | `stats` | per-class counts and sizes |

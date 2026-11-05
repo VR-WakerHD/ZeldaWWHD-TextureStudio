@@ -50,6 +50,59 @@ pub fn default_class_backends() -> Vec<(Class, BackendChoice)> {
     ]
 }
 
+/// Community ESRGAN-family models the Studio knows by name. They are not bundled (non-commercial licences, and they
+/// are published as PyTorch files): converted to ncnn (`<stem>.param` + `<stem>.bin`, e.g. with chaiNNer) and put in
+/// `tools/upscalers/custom-models/`, they run through `realesrgan-ncnn-vulkan` like any custom model. Only the ESRGAN
+/// (RRDB) builds convert; DAT/SPAN/Compact builds of the same names do not run in that tool.
+pub struct KnownModel {
+    pub stem: &'static str,
+    pub label: &'static str,
+    pub source: &'static str,
+    pub good_for: &'static str,
+}
+
+pub const KNOWN_CUSTOM: [KnownModel; 3] = [
+    KnownModel {
+        stem: "4x-AnimeSharp",
+        label: "4x-AnimeSharp (Kim2091)",
+        source: "https://openmodeldb.info/models/4x-AnimeSharp",
+        good_for: "line art, characters, UI: sharp clean edges",
+    },
+    KnownModel {
+        stem: "4x-UltraSharp",
+        label: "4x-UltraSharp (Kim2091)",
+        source: "https://openmodeldb.info/models/4x-UltraSharp",
+        good_for: "painted environment texture; can add grain, compare first",
+    },
+    KnownModel {
+        stem: "4x-IllustrationJaNai",
+        label: "4x-IllustrationJaNai (ESRGAN build)",
+        source: "https://openmodeldb.info (search IllustrationJaNai, ESRGAN architecture)",
+        good_for: "illustration-style art: characters and painted surfaces",
+    },
+];
+
+/// Models worth trying first for a class, best guess first. A suggestion only: the class backend stays what the
+/// user set, and a more aggressive model is not assumed to be better (compare in Compare models).
+pub fn recommended(class: Class) -> Vec<BackendChoice> {
+    let anime = BackendChoice::RealEsrgan("realesrgan-x4plus-anime".into());
+    let cunet = |noise| BackendChoice::Waifu2x { model: "models-cunet".into(), noise };
+    let cugan = BackendChoice::RealCugan { model: "models-se".into(), noise: -1 };
+    let custom = |s: &str| BackendChoice::Custom(s.into());
+    match class {
+        Class::CharacterAlbedo => vec![anime, custom("4x-AnimeSharp"), custom("4x-IllustrationJaNai"), cugan],
+        Class::EnvironmentAlbedo | Class::Terrain | Class::Rock | Class::Wood => vec![anime, cugan, custom("4x-IllustrationJaNai"), custom("4x-UltraSharp")],
+        Class::Foliage => vec![anime, cunet(0), cugan],
+        Class::Water | Class::Sky => vec![cunet(0), cugan, anime],
+        Class::Ui | Class::Lettering => vec![BackendChoice::Filter(Filter::Lanczos3), custom("4x-AnimeSharp"), BackendChoice::Waifu2x { model: "models-upconv_7_anime_style_art_rgb".into(), noise: 0 }],
+        Class::Particle => vec![BackendChoice::Filter(Filter::Lanczos3), cunet(0)],
+        Class::NormalMap => vec![BackendChoice::Filter(Filter::CatmullRom)],
+        Class::Mask => vec![BackendChoice::Filter(Filter::Mitchell)],
+        Class::Ramp => vec![BackendChoice::Native],
+        Class::Unknown => vec![BackendChoice::Filter(Filter::Lanczos3), anime],
+    }
+}
+
 /// Every backend the tool offers, for menus and comparisons.
 pub fn catalogue() -> Vec<BackendChoice> {
     let mut v = vec![BackendChoice::Native];
@@ -66,6 +119,19 @@ pub fn catalogue() -> Vec<BackendChoice> {
     for m in ["models-DF2K", "models-DF2K_JPEG"] {
         v.push(BackendChoice::RealSr(m.into()));
     }
+    v.extend(KNOWN_CUSTOM.iter().map(|k| BackendChoice::Custom(k.stem.into())));
+    v
+}
+
+/// The catalogue plus every other custom model found in the tools folder.
+pub fn catalogue_with(tools: &Tools) -> Vec<BackendChoice> {
+    let mut v = catalogue();
+    for m in tools.custom_models() {
+        let b = BackendChoice::Custom(m);
+        if !v.contains(&b) {
+            v.push(b);
+        }
+    }
     v
 }
 
@@ -74,11 +140,15 @@ impl BackendChoice {
         match self {
             BackendChoice::Native => "Native (no upscale)".into(),
             BackendChoice::Filter(f) => f.label().into(),
+            BackendChoice::RealEsrgan(m) if m == "realesrgan-x4plus-anime" => "Real-ESRGAN x4plus anime (RealESRGAN_x4plus_anime_6B)".into(),
             BackendChoice::RealEsrgan(m) => format!("Real-ESRGAN {m}"),
             BackendChoice::Waifu2x { model, noise } => format!("waifu2x {} noise {noise}", model.trim_start_matches("models-")),
             BackendChoice::RealCugan { model, noise } => format!("Real-CUGAN {} noise {noise}", model.trim_start_matches("models-")),
             BackendChoice::RealSr(m) => format!("RealSR {}", m.trim_start_matches("models-")),
-            BackendChoice::Custom(m) => format!("Custom ncnn {m}"),
+            BackendChoice::Custom(m) => match KNOWN_CUSTOM.iter().find(|k| k.stem == m) {
+                Some(k) => k.label.into(),
+                None => format!("Custom ncnn {m}"),
+            },
         }
     }
     /// Stable identifier used for cache paths. Includes the tool release so a
@@ -191,7 +261,12 @@ impl Tools {
         let name = if cfg!(windows) { format!("{base}.exe") } else { base.to_string() };
         find_file(&self.dir, &name, 3)
     }
+    /// The tool is installed, and for a custom model its `.param` and `.bin` too.
     pub fn available(&self, b: &BackendChoice) -> bool {
+        if let BackendChoice::Custom(m) = b {
+            let dir = self.dir.join("custom-models");
+            return self.exe(b).is_some() && dir.join(format!("{m}.param")).exists() && dir.join(format!("{m}.bin")).exists();
+        }
         !b.is_ai() || self.exe(b).is_some()
     }
     pub fn custom_models(&self) -> Vec<String> {
@@ -585,6 +660,38 @@ mod tests {
         );
         assert_eq!((out[0].w, out[1].w, out[2].w), (64, 16, 64));
         assert_eq!((out[0].rgba[0], out[1].rgba[0], out[2].rgba[0]), (13, 22, 33), "each pass fed the next, results back in job order");
+    }
+
+    #[test]
+    fn known_custom_models_need_their_files() {
+        let dir = std::env::temp_dir().join(format!("wwhd-custom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exe = dir.join("realesrgan").join(if cfg!(windows) { "realesrgan-ncnn-vulkan.exe" } else { "realesrgan-ncnn-vulkan" });
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+        let tools = Tools { dir: dir.clone() };
+        let b = BackendChoice::Custom("4x-AnimeSharp".into());
+        assert!(!tools.available(&b), "no model files yet");
+        std::fs::create_dir_all(dir.join("custom-models")).unwrap();
+        std::fs::write(dir.join("custom-models/4x-AnimeSharp.param"), b"").unwrap();
+        std::fs::write(dir.join("custom-models/4x-AnimeSharp.bin"), b"").unwrap();
+        std::fs::write(dir.join("custom-models/mine.param"), b"").unwrap();
+        assert!(tools.available(&b));
+        assert_eq!(b.label(), "4x-AnimeSharp (Kim2091)");
+        assert!(catalogue_with(&tools).contains(&BackendChoice::Custom("mine".into())));
+        assert_eq!(b.passes(4), [(4, 4)], "custom models are x4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_class_has_a_recommendation_and_data_never_gets_ai() {
+        for c in crate::classify::ALL_CLASSES {
+            let r = recommended(c);
+            assert!(!r.is_empty());
+            if matches!(c, Class::NormalMap | Class::Mask | Class::Ramp) {
+                assert!(r.iter().all(|b| !b.is_ai()), "{c:?}");
+            }
+        }
     }
 
     #[test]

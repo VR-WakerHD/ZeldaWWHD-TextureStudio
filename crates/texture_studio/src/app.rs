@@ -24,12 +24,15 @@ use crate::cli::{self, InstallKind};
 use crate::derived::{self, EnvInfo, Estimate, Found, FoundCache};
 use crate::images::ImageCache;
 
+mod enhance_view;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Quickstart,
     Dashboard,
     Assets,
     Compare,
+    Enhance,
     Settings,
     Queue,
     Export,
@@ -154,6 +157,22 @@ pub struct App {
     status: String,
     filter_dirty: bool,
     thumb_size: f32,
+    /// The Enhance tab's state and preview worker.
+    enh: enhance_view::EnhanceUi,
+    /// Diagnostics: a scripted screenshot of the window (`WWHD_STUDIO_SHOT`), see `Shot`.
+    shot: Option<Shot>,
+}
+
+/// Diagnostics for checking the GUI without driving it by hand: `WWHD_STUDIO_SHOT=<png>` saves a screenshot of the
+/// window after `WWHD_STUDIO_SHOT_WAIT` seconds (default 10) and closes the program. `WWHD_STUDIO_VIEW` picks the tab
+/// (`enhance`, `assets`, `compare`, `settings`), `WWHD_STUDIO_SELECT` selects the first texture whose name contains the
+/// text, `WWHD_STUDIO_ENH` sets the Enhance preview (see `EnhanceUi::automate`).
+struct Shot {
+    path: PathBuf,
+    wait: f32,
+    started: Option<std::time::Instant>,
+    requested: bool,
+    saved: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl App {
@@ -220,6 +239,14 @@ impl App {
             status: "Choose a project folder to start.".into(),
             filter_dirty: true,
             thumb_size: 96.0,
+            enh: enhance_view::EnhanceUi::new(&cc.egui_ctx),
+            shot: std::env::var_os("WWHD_STUDIO_SHOT").map(|p| Shot {
+                path: PathBuf::from(p),
+                wait: std::env::var("WWHD_STUDIO_SHOT_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0),
+                started: None,
+                requested: false,
+                saved: Arc::default(),
+            }),
         };
         // Reopen the last project.
         if let Some(last) = std::fs::read_to_string(last_project_file()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
@@ -584,6 +611,49 @@ impl App {
     }
 }
 
+impl App {
+    fn run_shot(&mut self, ctx: &egui::Context) {
+        let Some(shot) = &mut self.shot else { return };
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        if shot.saved.load(std::sync::atomic::Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if shot.started.is_none() {
+            if self.inv.is_none() {
+                return;
+            }
+            shot.started = Some(std::time::Instant::now());
+            if let Ok(v) = std::env::var("WWHD_STUDIO_VIEW") {
+                self.view = match v.as_str() {
+                    "assets" => View::Assets,
+                    "compare" => View::Compare,
+                    "settings" => View::Settings,
+                    _ => View::Enhance,
+                };
+            }
+            if let (Ok(name), Some(inv)) = (std::env::var("WWHD_STUDIO_SELECT"), &self.inv) {
+                self.selected = inv.textures.iter().position(|t| t.id.name.contains(&name));
+            }
+            if let Ok(spec) = std::env::var("WWHD_STUDIO_ENH") {
+                self.enh.automate(&spec, ctx.pixels_per_point());
+            }
+            return;
+        }
+        let shot = self.shot.as_mut().unwrap();
+        if !shot.requested && shot.started.unwrap().elapsed().as_secs_f32() >= shot.wait {
+            shot.requested = true;
+            let (path, saved) = (shot.path.clone(), shot.saved.clone());
+            ctx.request_screenshot(move |img| {
+                let [w, h] = img.size;
+                let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                let _ = wwhd_tex::project::save_png(&path, w as u32, h as u32, &bytes);
+                saved.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+    }
+}
+
 fn last_project_file() -> PathBuf {
     std::env::temp_dir().join("wwhd_texture_studio_last_project.txt")
 }
@@ -670,6 +740,7 @@ impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root.ctx().clone();
         self.pump(ctx);
+        self.run_shot(ctx);
         if self.filter_dirty {
             self.apply_filter();
         }
@@ -758,6 +829,7 @@ impl eframe::App for App {
                 (View::Dashboard, "Dashboard"),
                 (View::Assets, "Assets"),
                 (View::Compare, "Compare models"),
+                (View::Enhance, "Enhance"),
                 (View::Settings, "Settings"),
                 (View::Queue, "Queue & log"),
                 (View::Export, "Export / install"),
@@ -782,6 +854,7 @@ impl eframe::App for App {
             View::Dashboard => self.dashboard(ui),
             View::Assets => self.assets(ui),
             View::Compare => self.compare(ui),
+            View::Enhance => self.enhance_view(ui),
             View::Settings => self.settings_view(ui),
             View::Queue => self.queue(ui),
             View::Export => self.export_view(ui),

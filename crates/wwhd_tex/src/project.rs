@@ -83,6 +83,8 @@ pub struct Settings {
     pub mods_root: Option<PathBuf>,
     /// The game's executable (`wwhd.exe`); its folder decides portable mode when looking for the mod manager folder.
     pub game_exe: Option<PathBuf>,
+    /// Post-upscale enhancement (sharpening, detail, colour) applied when textures are encoded.
+    pub enhance: crate::enhance::EnhanceSettings,
 }
 
 /// Scale factors a texture or class can be set to (besides native).
@@ -150,6 +152,7 @@ impl Default for Settings {
             exclude_files: default_excluded(),
             mods_root: None,
             game_exe: None,
+            enhance: crate::enhance::EnhanceSettings::default(),
         }
     }
 }
@@ -181,7 +184,11 @@ pub struct Project {
 
 impl Project {
     pub fn open(root: impl Into<PathBuf>) -> Result<Project> {
-        let p = Project { root: root.into() };
+        // Absolute: the ncnn upscalers run in their own folder, so a relative scratch path would point elsewhere
+        // (Real-CUGAN then fails with "invalid outputpath extension type"). Not canonicalize: on Windows that gives
+        // a \?\ path, which the tools also misread.
+        let root: PathBuf = root.into();
+        let p = Project { root: std::path::absolute(&root).unwrap_or(root) };
         for d in ["source_inventory", "masters", "cache", "manifests", "output", "logs", "reports"] {
             std::fs::create_dir_all(p.root.join(d))?;
         }
@@ -274,4 +281,16 @@ pub fn load_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     let img = image::open(path).map_err(|e| crate::Error::Format(format!("{}: {e}", path.display())))?;
     let rgba = img.to_rgba8();
     Ok((rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
+#[cfg(test)]
+mod project_root_tests {
+    #[test]
+    fn a_relative_project_folder_is_made_absolute() {
+        let rel = std::path::PathBuf::from(format!("target/wwhd-rel-project-{}", std::process::id()));
+        let p = super::Project::open(&rel).unwrap();
+        assert!(p.root.is_absolute(), "{}", p.root.display());
+        assert!(!p.root.to_string_lossy().starts_with(r"\?\"));
+        let _ = std::fs::remove_dir_all(&p.root);
+    }
 }

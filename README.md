@@ -17,6 +17,7 @@ No game data is part of this repository, and none is written into it.
 | GX2 decode (BC1–BC5, RGBA8, R8, RG8, 565, 5551, 4444; tiled/linear; mips) | Working; layout + tiling verified byte-exact against 14 561 of 14 572 textures |
 | Classification (metadata + pixel statistics, manual override) | Working; rules, confidence, persisted overrides. No AI classifier |
 | Upscaling | Lanczos/Catmull-Rom/Mitchell/bilinear/nearest in-process; Real-ESRGAN, waifu2x, Real-CUGAN, RealSR via the official ncnn/Vulkan releases; custom ncnn models |
+| Post-upscale enhancement | Sharpening, edge-preserving detail recovery and colour (Oklab, gamut-mapped), per-class tuning, profiles Original / **Enhanced** (default) / Ultra Sharp / custom; alpha and data textures untouched; Enhance tab with split, side-by-side and variant comparisons; `enhance-bench` QA. See `docs/enhancement.md` |
 | Normal maps, masks, ramps, alpha | Vector-aware normal resize + renormalise; masks conventional; ramps native; alpha resized separately |
 | Mip generation | sRGB-linear box filter, alpha-coverage preserving, normal renormalising |
 | Rebuild + validation | FTEX/BFLIM rewrite, SARC/Yaz0 rebuild, reopen + compare, PSNR check of every encoded texture |
@@ -81,6 +82,7 @@ See `docs/user-guide.md` for details and the headless commands (`texture_studio 
 - `docs/formats.md` — supported resource formats, verification results
 - `docs/dependencies.md` — every dependency, its licence and redistribution notes
 - `docs/runtime-adapter.md` — the runtime adapter: what is implemented and where the design lives
+- `docs/enhancement.md` — post-upscale sharpening, detail and colour: stages, defaults, profiles, benchmark
 - `docs/user-guide.md` — GUI and command-line usage
 - `docs/performance.md` — measured timings and memory
 

@@ -5,6 +5,8 @@
 //! - normal maps: vectors averaged then renormalised;
 //! - masks and data: plain averaging, no colour conversion.
 
+use crate::resample::{self, Edge, Filter};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MipMode {
     Colour { srgb: bool, alpha_test: bool },
@@ -105,8 +107,33 @@ fn downsample(w: u32, h: u32, src: &[u8], mode: MipMode) -> (u32, u32, Vec<u8>) 
     (nw, nh, out)
 }
 
+/// Halve a colour level with a Catmull-Rom filter (8 taps per axis) instead of a 2×2 box: in linear light for sRGB
+/// formats, in stored values otherwise, like the box filter. Sharper distant mips; the filter's small negative
+/// lobes are clamped to the 0..1 range.
+fn downsample_sharp(w: u32, h: u32, src: &[u8], srgb: bool, edge: Edge) -> (u32, u32, Vec<u8>) {
+    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+    let lut: Vec<f32> = (0..256).map(|i| if srgb { srgb_to_linear(i as f32 / 255.0) } else { i as f32 / 255.0 }).collect();
+    let f: Vec<f32> = src.chunks_exact(4).flat_map(|p| [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize], p[3] as f32 / 255.0]).collect();
+    let r = resample::resize(w as usize, h as usize, 4, &f, nw as usize, nh as usize, Filter::CatmullRom, edge);
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let out = r
+        .chunks_exact(4)
+        .flat_map(|p| {
+            let c = |v: f32| if srgb { q(linear_to_srgb(v.clamp(0.0, 1.0))) } else { q(v) };
+            [c(p[0]), c(p[1]), c(p[2]), q(p[3])]
+        })
+        .collect();
+    (nw, nh, out)
+}
+
 /// Build `count` levels starting from level 0.
 pub fn chain(w: u32, h: u32, base: Vec<u8>, count: u32, mode: MipMode) -> Vec<(u32, u32, Vec<u8>)> {
+    chain_with(w, h, base, count, mode, None)
+}
+
+/// Like [`chain`]; `sharp` (with the texture's edge addressing) reduces colour levels with Catmull-Rom instead of
+/// the box filter. Normal maps and data always use the box filter.
+pub fn chain_with(w: u32, h: u32, base: Vec<u8>, count: u32, mode: MipMode, sharp: Option<Edge>) -> Vec<(u32, u32, Vec<u8>)> {
     let target = match mode {
         MipMode::Colour { alpha_test: true, .. } => Some(coverage(&base, 0.5, 1.0)),
         _ => None,
@@ -114,7 +141,10 @@ pub fn chain(w: u32, h: u32, base: Vec<u8>, count: u32, mode: MipMode) -> Vec<(u
     let mut levels = vec![(w, h, base)];
     for _ in 1..count.max(1) {
         let (pw, ph, prev) = levels.last().unwrap();
-        let (nw, nh, mut img) = downsample(*pw, *ph, prev, mode);
+        let (nw, nh, mut img) = match (mode, sharp) {
+            (MipMode::Colour { srgb, .. }, Some(edge)) => downsample_sharp(*pw, *ph, prev, srgb, edge),
+            _ => downsample(*pw, *ph, prev, mode),
+        };
         if let Some(t) = target {
             // Binary search an alpha scale that restores the coverage.
             let (mut lo, mut hi) = (0.25f32, 4.0f32);
@@ -178,6 +208,30 @@ mod tests {
         let c0 = coverage(&l[0].2, 0.5, 1.0);
         let c2 = coverage(&l[2].2, 0.5, 1.0);
         assert!((c0 - c2).abs() < 0.1, "{c0} vs {c2}");
+    }
+
+    #[test]
+    fn sharp_mips_keep_more_contrast_and_constant_stays_constant() {
+        // A smooth wave of period 10 texels keeps more of its amplitude through Catmull-Rom than through the box.
+        let (w, h) = (40u32, 8u32);
+        let img: Vec<u8> = (0..w * h).flat_map(|i| {
+            let x = (i % w) as f32;
+            let v = (120.0 + 80.0 * (x * std::f32::consts::TAU / 10.0).sin()) as u8;
+            [v, v, v, 255]
+        }).collect();
+        let mode = MipMode::Colour { srgb: true, alpha_test: false };
+        let spread = |l: &[u8]| l.chunks_exact(4).map(|p| p[0]).max().unwrap() as i32 - l.chunks_exact(4).map(|p| p[0]).min().unwrap() as i32;
+        let boxed = chain(w, h, img.clone(), 2, mode);
+        let sharp = chain_with(w, h, img, 2, mode, Some(Edge::Wrap));
+        assert_eq!((sharp[1].0, sharp[1].1), (20, 4));
+        assert!(spread(&sharp[1].2) >= spread(&boxed[1].2), "{} vs {}", spread(&sharp[1].2), spread(&boxed[1].2));
+        let flat = vec![123u8; 16 * 16 * 4];
+        let l = chain_with(16, 16, flat, 5, mode, Some(Edge::Clamp));
+        assert!(l.iter().all(|(_, _, d)| d.iter().all(|v| (*v as i32 - 123).abs() <= 1)));
+        // Normal maps ignore the sharp option.
+        let n = vec![128u8; 8 * 8 * 4];
+        let nm = MipMode::Normal { two_channel: true, snorm: false };
+        assert_eq!(chain_with(8, 8, n.clone(), 3, nm, Some(Edge::Wrap)), chain(8, 8, n, 3, nm));
     }
 
     #[test]

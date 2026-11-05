@@ -59,7 +59,7 @@ impl ImageCache {
             self.pending.remove(&path);
             match img {
                 Some(img) => {
-                    let opts = TextureOptions { magnification: egui::TextureFilter::Nearest, ..TextureOptions::LINEAR };
+                    let opts = TextureOptions { magnification: egui::TextureFilter::Nearest, mipmap_mode: Some(egui::TextureFilter::Linear), ..TextureOptions::LINEAR };
                     let h = ctx.load_texture(path.to_string_lossy(), img, opts);
                     self.textures.insert(path.clone(), h);
                     self.order.push_back(path);

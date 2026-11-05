@@ -132,6 +132,24 @@ fn encode_level(fmt: PackFormat, w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>>
     Ok(enc.data)
 }
 
+/// Level 0 as the game will see it: encoded in `fmt` exactly like the export does, then decoded (for previews).
+pub fn encode_preview(fmt: PackFormat, w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    let image_format = match fmt {
+        PackFormat::Rgba8 { .. } => return Ok(rgba.to_vec()),
+        PackFormat::Bc7 { srgb: false } => ImageFormat::BC7RgbaUnorm,
+        PackFormat::Bc7 { srgb: true } => ImageFormat::BC7RgbaUnormSrgb,
+        PackFormat::Bc4 { snorm: false } => ImageFormat::BC4RUnorm,
+        PackFormat::Bc4 { snorm: true } => ImageFormat::BC4RSnorm,
+        PackFormat::Bc5 { snorm: false } => ImageFormat::BC5RgUnorm,
+        PackFormat::Bc5 { snorm: true } => ImageFormat::BC5RgSnorm,
+    };
+    let blocks = encode_level(fmt, w, h, rgba)?;
+    let (pw, ph) = (w.div_ceil(4) * 4, h.div_ceil(4) * 4);
+    let surf = image_dds::Surface { width: pw, height: ph, depth: 1, layers: 1, mipmaps: 1, image_format, data: &blocks[..] };
+    let dec = surf.decode_rgba8().map_err(|e| Error::Format(format!("decode: {e}")))?.data;
+    Ok(crate::resample::crop_rgba8(pw, &dec, 0, 0, w, h))
+}
+
 /// The most levels a `width` x `height` image can have: 1 + floor(log2(max side)), the bound the recomp's loader enforces.
 pub fn max_levels(width: u32, height: u32) -> u32 {
     32 - width.max(height).max(1).leading_zeros()
@@ -565,23 +583,25 @@ fn encode_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, c: &Can
     h.update(&png_bytes);
     h.update(t.key.as_bytes());
     h.update(format!("{class:?}{}{}{:?}{:?}", c.scale, s.debug_tint, t.surface, c.fmt).as_bytes());
+    let (profile, target) = pipeline::enhance_inputs(s, inv, d, c.record, &c.png, c.scale);
+    h.update(crate::enhance::cache_tag(&profile, &s.enhance, &target).as_bytes());
     let cache = p.encoded_dds_path(&h.finalize().to_hex());
     if !cache.exists() {
         let img = image::load_from_memory(&png_bytes).map_err(|e| Error::Format(format!("{}: {e}", c.png.display())))?.to_rgba8();
         let (w, hh) = (img.width(), img.height());
-        let mut rgba = img.into_raw();
+        if (w, hh) != (t.surface.width * c.scale, t.surface.height * c.scale) {
+            bail!("upscaled image is {w}x{hh}, expected x{}", c.scale);
+        }
+        let (mut rgba, sharp) = pipeline::enhance_level0(p, s, inv, c.record, &profile, &target, w, hh, img.into_raw());
         if s.debug_tint {
             for px in rgba.chunks_exact_mut(4) {
                 px[1] /= 3;
             }
         }
-        if (w, hh) != (t.surface.width * c.scale, t.surface.height * c.scale) {
-            bail!("upscaled image is {w}x{hh}, expected x{}", c.scale);
-        }
         // Original levels plus one per doubling, never more than the size allows.
         let count = mips::upscaled_mip_count(t.surface.mip_count, c.scale).min(max_levels(w, hh));
         let mode = pipeline::mip_mode(class, t.surface.format, &rgba);
-        let levels: Vec<Vec<u8>> = mips::chain(w, hh, rgba, count, mode).into_iter().map(|(_, _, l)| l).collect();
+        let levels: Vec<Vec<u8>> = mips::chain_with(w, hh, rgba, count, mode, sharp).into_iter().map(|(_, _, l)| l).collect();
         write_atomic(&cache, &write_dds(w, hh, c.fmt, &levels)?)?;
     }
     let bytes = std::fs::metadata(&cache)?.len();
@@ -732,6 +752,16 @@ mod tests {
         let dec = surf.decode_rgba8().unwrap().data;
         let worst = rgba.iter().zip(&dec).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
         assert!(worst <= 6, "worst channel error {worst}");
+    }
+
+    #[test]
+    fn encode_preview_matches_the_size_and_is_close() {
+        let rgba = gradient(30, 18);
+        let out = encode_preview(PackFormat::Bc7 { srgb: true }, 30, 18, &rgba).unwrap();
+        assert_eq!(out.len(), rgba.len());
+        let worst = rgba.iter().zip(&out).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 8, "worst {worst}");
+        assert_eq!(encode_preview(PackFormat::Rgba8 { srgb: false }, 30, 18, &rgba).unwrap(), rgba);
     }
 
     #[test]
@@ -999,6 +1029,33 @@ mod tests {
         let at = 148 + (31 * 32) * 4 + 1;
         assert!(plain[at] > 200, "{}", plain[at]);
         assert_eq!(tinted[at], plain[at] / 3, "green is divided by three like the archive export");
+    }
+
+    #[test]
+    fn the_enhancement_profile_decides_the_written_texture_and_data_is_never_enhanced() {
+        let mut rig = Rig::new("enhance");
+        rig.add("a.bflim", "aa", Class::Rock, 16, 0x09, &pattern(1024, 5), true);
+        rig.add("b.bflim", "bb", Class::Mask, 16, 0x09, &pattern(1024, 9), true);
+        let read = |rig: &Rig, file: &str| {
+            let dir = rig.runtime_dir().join("wwhd-texture-studio-tex-1");
+            let idx = index_of(&dir);
+            let e = idx["entries"].as_array().unwrap().iter().find(|e| e["name"].as_str().unwrap_or("").contains(file)).unwrap().clone();
+            std::fs::read(dir.join("textures").join(e["file"].as_str().unwrap())).unwrap()
+        };
+        let run = |rig: &Rig| export_runtime(&rig.p, &rig.s, &rig.inv, &Decisions::default(), &Progress::default()).unwrap();
+        rig.s.enhance.enabled = false;
+        run(&rig);
+        let (off_a, off_b) = (read(&rig, "a.bflim"), read(&rig, "b.bflim"));
+        rig.s.enhance.enabled = true;
+        run(&rig);
+        let (enh_a, enh_b) = (read(&rig, "a.bflim"), read(&rig, "b.bflim"));
+        rig.s.enhance.profile = crate::enhance::ULTRA.into();
+        run(&rig);
+        let ultra_a = read(&rig, "a.bflim");
+        assert_eq!(off_a.len(), enh_a.len(), "same format, size and mip count");
+        assert_ne!(off_a, enh_a, "Enhanced changes a colour texture");
+        assert_ne!(enh_a, ultra_a, "a changed profile re-encodes (no stale cache hit)");
+        assert_eq!(off_b, enh_b, "a mask is never enhanced");
     }
 
     #[test]
