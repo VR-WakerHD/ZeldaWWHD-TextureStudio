@@ -94,6 +94,9 @@ pub(crate) fn load_inventory(p: &Project) -> Result<Inventory> {
 fn run(cmd: &str, a: &Args) -> Result<()> {
     let project = Project::open(a.get("--project").unwrap_or_else(|| "studio_project".into()))?;
     let mut s = project.load_settings();
+    // Saved only when an option below changed something: a read-only command (stats, compare, enhance-bench) must
+    // not rewrite settings.json while the GUI has the project open.
+    let loaded = serde_json::to_string(&s).unwrap_or_default();
     if let Some(d) = a.get("--disc") {
         s.disc_root = PathBuf::from(d);
     }
@@ -116,7 +119,9 @@ fn run(cmd: &str, a: &Args) -> Result<()> {
     if let Some(t) = a.get("--tools") {
         s.tools_dir = PathBuf::from(t);
     }
-    project.save_settings(&s)?;
+    if serde_json::to_string(&s).unwrap_or_default() != loaded {
+        project.save_settings(&s)?;
+    }
     let prog = console_progress(&project);
     prog.set_running(true);
     let d = Decisions::load(&project.review_path(), &project.classes_path());

@@ -288,6 +288,9 @@ fn profile_editor(ui: &mut egui::Ui, p: &mut Profile) -> bool {
         ch |= slider(ui, &mut p.sharpen.threshold, 0.0..=10.0, "threshold", "Differences smaller than this many 8-bit levels are left alone, so flat cel shading stays flat");
         ch |= ui.checkbox(&mut p.sharpen.edge_protection, "Edge protection").on_hover_text("Less sharpening on edges that are already strong (outlines)").changed();
         ch |= ui.checkbox(&mut p.sharpen.halo_suppression, "Halo suppression").on_hover_text("Every texel stays within its neighbourhood's original range: no rings or rims").changed();
+        ui.add_enabled_ui(p.sharpen.halo_suppression, |ui| {
+            ch |= slider(ui, &mut p.sharpen.halo_margin, 0.0..=12.0, "halo margin (levels)", "How far a texel may go past its neighbourhood's range. About 1 = no rims; a few levels add crispness once edges are fully steepened; much more brings rims back");
+        });
         ch |= ui.checkbox(&mut p.sharpen.adaptive, "Adaptive to texture").on_hover_text("Measured per texture: busy, noisy art is sharpened less, clean art a little more").changed();
     });
     ui.separator();

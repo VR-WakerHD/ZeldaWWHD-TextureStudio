@@ -55,6 +55,9 @@ pub struct Sharpen {
     pub edge_protection: bool,
     /// The result stays within the neighbourhood's range (plus a small margin): no ringing or bright/dark halos.
     pub halo_suppression: bool,
+    /// How far (8-bit lightness levels) a texel may go past its neighbourhood's range with halo suppression on.
+    /// About 1 keeps edges rim-free; a few levels add crispness (acutance) once an edge is fully steepened.
+    pub halo_margin: f32,
     /// Less sharpening on busy, noisy textures, a little more on clean ones (measured per texture).
     pub adaptive: bool,
 }
@@ -70,6 +73,7 @@ impl Default for Sharpen {
             threshold: 2.0,
             edge_protection: true,
             halo_suppression: true,
+            halo_margin: 1.0,
             adaptive: true,
         }
     }
@@ -171,6 +175,8 @@ impl Default for Profile {
 pub const ORIGINAL: &str = "Wind Waker Original";
 pub const ENHANCED: &str = "Wind Waker Enhanced";
 pub const ULTRA: &str = "Wind Waker Ultra Sharp";
+pub const ULTRA_PLUS: &str = "Wind Waker Ultra Sharp +";
+pub const ULTRA_PLUS_PLUS: &str = "Wind Waker Ultra Sharp ++";
 
 /// Minimal sharpening, colours as painted.
 pub fn original() -> Profile {
@@ -196,6 +202,34 @@ pub fn ultra() -> Profile {
         sharpen: Sharpen { radius: 0.7, amount: 0.85, ..Sharpen::default() },
         detail: Detail { amount: 0.55, restore: 0.15, ..Detail::default() },
         colour: Colour { saturation: 0.08, vibrance: 0.08, contrast: 0.04, ..Colour::default() },
+        per_class: true,
+        sharp_mips: true,
+    }
+}
+
+/// Stronger than Ultra Sharp: bolder radius, more sharpening and detail, lower threshold, and a 3-level halo
+/// margin (a little overshoot for crispness). Edge protection stays on; colour as Ultra Sharp.
+pub fn ultra_plus() -> Profile {
+    Profile {
+        name: ULTRA_PLUS.into(),
+        sharpen: Sharpen { radius: 0.8, amount: 1.2, threshold: 1.5, halo_margin: 3.0, ..Sharpen::default() },
+        detail: Detail { amount: 0.8, restore: 0.2, ..Detail::default() },
+        colour: Colour { saturation: 0.08, vibrance: 0.08, contrast: 0.04, ..Colour::default() },
+        per_class: true,
+        sharp_mips: true,
+    }
+}
+
+/// The strongest built-in: the boldest radius and amount, detail lifted furthest; threshold 1.5 (at 1 the AI's faint
+/// noise turned into grain). Edge protection and
+/// the 3-level halo margin stay as in Ultra Sharp +: with edge protection off or a larger margin, light rims
+/// appeared around dark shapes (checked on real textures, 2026-11-04).
+pub fn ultra_plus_plus() -> Profile {
+    Profile {
+        name: ULTRA_PLUS_PLUS.into(),
+        sharpen: Sharpen { radius: 1.0, amount: 1.7, threshold: 1.5, halo_margin: 3.0, ..Sharpen::default() },
+        detail: Detail { amount: 1.1, restore: 0.25, ..Detail::default() },
+        colour: Colour { saturation: 0.08, vibrance: 0.1, contrast: 0.05, ..Colour::default() },
         per_class: true,
         sharp_mips: true,
     }
@@ -236,11 +270,11 @@ pub fn with_colour_strength(p: &Profile, k: f32) -> Profile {
 }
 
 pub fn builtins() -> Vec<Profile> {
-    vec![original(), enhanced(), ultra()]
+    vec![original(), enhanced(), ultra(), ultra_plus(), ultra_plus_plus()]
 }
 
 pub fn is_builtin(name: &str) -> bool {
-    [ORIGINAL, ENHANCED, ULTRA].contains(&name)
+    [ORIGINAL, ENHANCED, ULTRA, ULTRA_PLUS, ULTRA_PLUS_PLUS].contains(&name)
 }
 
 /// Project-wide enhancement settings (in `settings.json`).
@@ -626,9 +660,9 @@ fn local_range(w: usize, h: usize, v: &[f32], r: usize, edge: Edge) -> (Vec<f32>
     (mn, mx)
 }
 
-/// Halo suppression window radius (output pixels) and margin (Oklab L, ~1 level).
+/// Halo suppression window radius (output pixels), and the Oklab L of one 8-bit level for the margin.
 const HALO_WINDOW: usize = 2;
-const HALO_MARGIN: f32 = 0.004;
+const LEVEL: f32 = 0.004;
 
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     if e1 <= e0 {
@@ -861,8 +895,9 @@ pub fn apply(w: u32, h: u32, rgba: &[u8], r: &Resolved, original: Option<(u32, u
     // image's 5×5 neighbourhood plus about one 8-bit level, so edges get steeper but no rim appears on either side.
     let suppress = r.sharpen.map_or(r.detail.is_some(), |s| s.halo_suppression);
     if suppress && (r.sharpen.is_some() || r.detail.is_some()) {
+        let margin = r.sharpen.map_or(1.0, |s| s.halo_margin).clamp(0.0, 20.0) * LEVEL;
         let (mn, mx) = local_range(w, h, &l0, HALO_WINDOW, edge);
-        l.par_iter_mut().enumerate().for_each(|(i, v)| *v = v.clamp(mn[i] - HALO_MARGIN, mx[i] + HALO_MARGIN));
+        l.par_iter_mut().enumerate().for_each(|(i, v)| *v = v.clamp(mn[i] - margin, mx[i] + margin));
     }
     let mean_l = {
         let (s, n) = l0.iter().zip(&wt).fold((0f64, 0f64), |(s, n), (v, a)| (s + (v * a) as f64, n + *a as f64));
@@ -1171,6 +1206,31 @@ mod tests {
         assert_eq!((e.colour.saturation, e.colour.vibrance, e.colour.contrast, e.colour.gamma), (0.07, 0.05, 0.03, 1.0));
         assert!(e.colour.protect_highlights && e.colour.protect_shadows);
         assert_eq!(EnhanceSettings::default().profile, ENHANCED);
+    }
+
+    #[test]
+    fn the_ultra_profiles_get_stronger_in_order_and_keep_their_safeguards() {
+        let chain = [ultra(), ultra_plus(), ultra_plus_plus()];
+        for w in chain.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            assert!(b.sharpen.amount > a.sharpen.amount && b.sharpen.radius > a.sharpen.radius, "{} → {}", a.name, b.name);
+            assert!(b.detail.amount > a.detail.amount && b.sharpen.threshold <= a.sharpen.threshold);
+            assert!(b.sharpen.halo_margin >= a.sharpen.halo_margin);
+        }
+        for p in &chain {
+            assert!(p.sharpen.halo_suppression && p.colour.protect_highlights && p.colour.protect_shadows, "{}", p.name);
+            assert!(is_builtin(&p.name));
+        }
+        // Measured: each step is sharper on a soft painted texture, and alpha stays untouched.
+        let img = art(64, 64, true);
+        let sharp = |p: &Profile| {
+            let r = resolve(p, &EnhanceSettings::default(), &target(Class::Rock), &img).unwrap();
+            let (out, _) = apply(64, 64, &img, &r, None);
+            assert!(out.chunks_exact(4).zip(img.chunks_exact(4)).all(|(a, b)| a[3] == b[3]));
+            crate::quality::sharpness(64, 64, &out)
+        };
+        let s: Vec<f32> = chain.iter().map(sharp).collect();
+        assert!(s[0] < s[1] && s[1] < s[2], "{s:?}");
     }
 
     #[test]

@@ -41,22 +41,23 @@ does the same for darkening over the bottom 10 %. Both apply to the total change
 
 ## Stages and defaults
 
-| Parameter | Original | **Enhanced (default)** | Ultra Sharp |
-|---|---:|---:|---:|
-| Unsharp mask radius (source texels) | 0.6 | **0.6** | 0.7 |
-| Sharpening amount | 25 % | **55 %** | 85 % |
-| Threshold (8-bit levels) | 3 | **2** | 2 |
-| Edge protection / halo suppression / adaptive | on | **on** | on |
-| Detail recovery (local contrast) | off | **30 %** | 55 % |
-| Detail size (source texels) / edge level | — | **0.75 / 0.05** | 0.75 / 0.05 |
-| Texture restoration | off | **0 %** | 15 % |
-| Saturation | 0 | **+7 %** | +8 % |
-| Vibrance | 0 | **+5 %** | +8 % |
-| Contrast | 0 | **+3 %** | +4 % |
-| Gamma | 1.0 | **1.0** | 1.0 |
-| Highlight / shadow protection | on | **on** | on |
-| Per-class tuning | on | **on** | on |
-| Sharper mips (Catmull-Rom) | off | **on** | on |
+| Parameter | Original | **Enhanced (default)** | Ultra Sharp | Ultra Sharp + | Ultra Sharp ++ |
+|---|---:|---:|---:|---:|---:|
+| Unsharp mask radius (source texels) | 0.6 | **0.6** | 0.7 | 0.8 | 1.0 |
+| Sharpening amount | 25 % | **55 %** | 85 % | 120 % | 170 % |
+| Threshold (8-bit levels) | 3 | **2** | 2 | 1.5 | 1.5 |
+| Edge protection / halo suppression / adaptive | on | **on** | on | on | on |
+| Halo margin (8-bit levels) | 1 | **1** | 1 | 3 | 3 |
+| Detail recovery (local contrast) | off | **30 %** | 55 % | 80 % | 110 % |
+| Detail size (source texels) / edge level | — | **0.75 / 0.05** | 0.75 / 0.05 | 0.75 / 0.05 | 0.75 / 0.05 |
+| Texture restoration | off | **0 %** | 15 % | 20 % | 25 % |
+| Saturation | 0 | **+7 %** | +8 % | +8 % | +8 % |
+| Vibrance | 0 | **+5 %** | +8 % | +8 % | +10 % |
+| Contrast | 0 | **+3 %** | +4 % | +4 % | +5 % |
+| Gamma | 1.0 | **1.0** | 1.0 | 1.0 | 1.0 |
+| Highlight / shadow protection | on | **on** | on | on | on |
+| Per-class tuning | on | **on** | on | on | on |
+| Sharper mips (Catmull-Rom) | off | **on** | on | on | on |
 
 **Radius unit.** The radius counts *source texels* by default, so ×4 output is sharpened with a 2.4 px sigma. In
 output pixels, 0.6 px on a ×4 texture is a quarter of a painted texel: the benchmark measured +3 % sharpness, and
@@ -69,9 +70,16 @@ outlines up to 60 % less than fine detail. *Adaptive* measures how busy the text
 +15 %, noisy art down to −40 %.
 
 **Halo suppression.** After detail and sharpening, every texel is clamped to the 5×5 neighbourhood range of the
-unenhanced image, plus about one 8-bit level. Edges get steeper, but no rim can form on either side of them. Before
+unenhanced image, plus the profile's *halo margin* (1 level by default; 3 in Ultra Sharp + and ++). Edges get steeper, but no rim can form on either side of them. Before
 this clamp, a 2.4 px sigma produced visible light rims along dark outlines (halo measure 9 %). With it, the measure
 is 0.03 % for sharpening alone.
+
+**Ultra Sharp + and ++.** Once an edge is fully steepened inside its neighbourhood's range, more strength changes
+nothing, so these two also allow a 3-level overshoot (acutance). Measured on 7 textures against the AI upscale:
+Ultra Sharp +8 % to +99 % sharper, Ultra Sharp ++ +10 % to +142 % (water lowest, roofs and stone highest). A 6- or
+4-level margin, or edge protection off, put light rims around dark shapes; a threshold of 1 turned the AI's faint
+noise into grain. Both are tuned below those points, but at 100 % zoom they look processed: check them in the
+headset, where distant surfaces are seen through mips.
 
 **Detail recovery** is a self-guided filter on lightness. Regions whose local contrast is below the edge level count
 as painted texture and are lifted; edges above it are left alone. *Texture restoration* puts back the original's own
@@ -84,7 +92,7 @@ box. Normal maps and data always use the box. Alpha-tested coverage preservation
 ## Per-class tuning
 
 | Category (from class + alpha) | Sharpen | Detail | Colour | Why |
-|---|---:|---:|---:|---|
+|---|---:|---:|---:|---:|---:|---|
 | Character artwork | ×1.0 | ×0.8 | ×1.0 | soft painted gradients on faces and cloth |
 | Environment artwork, terrain | ×1.0 | ×1.0 | ×1.0 | |
 | Vegetation | ×0.75 | ×0.8 | ×1.0 | over-sharpened foliage shimmers in VR |
@@ -101,7 +109,7 @@ gives every colour texture the same strengths (UI colour stays unchanged).
 
 ## Profiles
 
-Wind Waker Original, Enhanced (the default) and Ultra Sharp are built in and fixed. In **Enhance**: *Duplicate*
+Wind Waker Original, Enhanced (the default), Ultra Sharp, Ultra Sharp + and Ultra Sharp ++ are built in and fixed. In **Enhance**: *Duplicate*
 makes an editable custom profile; the name field renames it; *Reset to Enhanced* restores defaults and keeps the
 name; *Delete* removes it; *Save to file… / Load from file…* exchange profiles as JSON. Custom profiles live in the
 project's `settings.json` (`enhance.custom`). Each texture can pick its own profile (stored in
