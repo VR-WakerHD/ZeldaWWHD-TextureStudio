@@ -173,17 +173,19 @@ pub(super) enum VariantSet {
     Profiles,
     Sharpen,
     Colour,
+    CutoutEdges,
     Models,
 }
 
 impl VariantSet {
-    const ALL: [VariantSet; 5] = [VariantSet::Stages, VariantSet::Profiles, VariantSet::Sharpen, VariantSet::Colour, VariantSet::Models];
+    const ALL: [VariantSet; 6] = [VariantSet::Stages, VariantSet::Profiles, VariantSet::Sharpen, VariantSet::Colour, VariantSet::CutoutEdges, VariantSet::Models];
     fn label(self) -> &'static str {
         match self {
             VariantSet::Stages => "Stages (upscale / +sharpen / +colour / all)",
             VariantSet::Profiles => "Profiles",
             VariantSet::Sharpen => "Sharpening strength",
             VariantSet::Colour => "Colour strength",
+            VariantSet::CutoutEdges => "Cut-out edges (every option)",
             VariantSet::Models => "Models (active profile on each)",
         }
     }
@@ -251,6 +253,7 @@ impl EnhanceUi {
                         "sharpen" => VariantSet::Sharpen,
                         "colour" => VariantSet::Colour,
                         "models" => VariantSet::Models,
+                        "cutout" => VariantSet::CutoutEdges,
                         _ => VariantSet::Stages,
                     };
                 }
@@ -329,6 +332,11 @@ fn profile_editor(ui: &mut egui::Ui, p: &mut Profile) -> bool {
     ui.label(RichText::new("Clean-up").strong());
     ch |= pct(ui, &mut p.cleanup.dering, 0.0..=1.0, "halo removal", "Removes the bright and dark rims upscalers add along strong edges: lightness stays within the original's local range. Detail inside that range is kept");
     ch |= ui.checkbox(&mut p.cleanup.crisp_cutouts, "Crisp cut-out edges").on_hover_text("Cut-out textures (leaves, fences, grates) get their alpha rebuilt from the original: same outline, 1-2 pixel edge instead of a soft blur. Blended transparency is left alone").changed();
+    ui.add_enabled_ui(p.cleanup.crisp_cutouts, |ui| {
+        ch |= slider(ui, &mut p.cleanup.edge_width, 0.5..=4.0, "edge width (px)", "Width of the anti-aliased cut-out edge in output pixels. Under 1 = razor sharp but can shimmer in VR when you move; 1.5-2.5 = crisp and steadier");
+        ch |= slider(ui, &mut p.cleanup.edge_smoothing, 0.0..=1.0, "edge smoothing (texels)", "Irons out the original's pixel staircase on diagonal edges. Too much rounds corners and thins grass blades");
+        ch |= ui.checkbox(&mut p.cleanup.edge_follow_colour, "Follow colour edges").on_hover_text("Snaps the cut-out edge to the edge in the upscaled colour, so silhouettes line up with the painted outline").changed();
+    });
     ui.separator();
     ch |= ui.checkbox(&mut p.per_class, "Tune per texture class").on_hover_text("Strengths scaled per class: e.g. water and sky sharpened less, stone more, UI colours never changed. Low-confidence classes get 60 %").changed();
     ch |= ui.checkbox(&mut p.sharp_mips, "Sharper mips (Catmull-Rom)").on_hover_text("Distant mip levels reduced with Catmull-Rom instead of a 2×2 box: crisper at a distance").changed();
@@ -348,7 +356,7 @@ impl App {
 
     fn enhance_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Enhancement");
-        ui.label(RichText::new("Runs on the cached upscale when textures are exported: changing it re-encodes, it never re-upscales. Normal maps, masks, ramps, one/two-channel formats and Unknown-class textures are never touched; alpha is never changed.").weak());
+        ui.label(RichText::new("Runs on the cached upscale when textures are exported: changing it re-encodes, it never re-upscales. Normal maps, masks, ramps, one/two-channel formats and Unknown-class textures are never touched. Alpha changes only at the edges of cut-out textures (see Cut-out edges); blended transparency never changes.").weak());
         let mut s = self.settings.enhance.clone();
         let mut changed = ui.checkbox(&mut s.enabled, "Enhance textures on export").changed();
         ui.horizontal(|ui| {
@@ -363,6 +371,14 @@ impl App {
             .checkbox(&mut s.fill_transparent, "Fill colour under transparent texels (cut-outs)")
             .on_hover_text("Replaces the hidden colour of fully transparent texels in cut-out textures with the nearest visible colour, so filtering cannot pull dark or bright fringes into edges. Off by default: where alpha is not coverage, the hidden colour is visible.")
             .changed();
+        ui.horizontal(|ui| {
+            ui.label("Cut-out edges:").on_hover_text("For leaves, grass, fences, feathers, eye decals and other cut-out textures, with any profile. Compare them on the selected texture with Variants > Cut-out edges");
+            egui::ComboBox::from_id_salt("cutout_edges").selected_text(s.cutout_edges.label()).show_ui(ui, |ui| {
+                for c in enhance::CutoutChoice::ALL {
+                    changed |= ui.selectable_value(&mut s.cutout_edges, c, c.label()).on_hover_text(c.hint()).changed();
+                }
+            });
+        });
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Edit:");
@@ -634,6 +650,18 @@ impl App {
                         .collect(),
                     VariantSet::Sharpen => [0.0, 0.5, 1.0, 1.5, 2.0].iter().map(|k| (format!("sharpen ×{k}"), mk(Some(&enhance::with_sharpen_strength(&base, *k)), false, &png))).collect(),
                     VariantSet::Colour => [0.0, 0.5, 1.0, 1.5, 2.0].iter().map(|k| (format!("colour ×{k}"), mk(Some(&enhance::with_colour_strength(&base, *k)), false, &png))).collect(),
+                    VariantSet::CutoutEdges => enhance::CutoutChoice::ALL
+                        .iter()
+                        .filter(|c| **c != enhance::CutoutChoice::FromProfile)
+                        .map(|c| {
+                            let mut st = settings.clone();
+                            st.cutout_edges = *c;
+                            let mut q = mk(Some(&base), false, &png);
+                            q.settings = st.clone();
+                            q.id = format!("{}|cutout-{:?}", q.id, c);
+                            (c.label().to_string(), q)
+                        })
+                        .collect(),
                     VariantSet::Models => upscale::catalogue_with(&tools)
                         .into_iter()
                         .filter(|b| b.is_ai())

@@ -159,7 +159,16 @@ the profile editor).
 
 **Crisp cut-out edges.** When the *original's* alpha is a cut-out (mostly 0 or 255), the alpha is rebuilt from it.
 The original alpha is enlarged with Catmull-Rom, so the contour and the coverage at the 0.5 test stay where they
-were, then a steep ramp (half-width 0.4/scale) makes the edge 1–2 pixels wide instead of the soft enlarged one.
+were. Optional *smoothing* (a Gaussian, in source texels) irons out the original's pixel staircase, and optional
+*follow colour* moves the outline onto the edge in the upscaled colour with a guided filter. Then a steep ramp makes
+the edge *edge width* output pixels wide instead of the soft enlarged one.
+
+The default is **1.5 px with 0.5-texel smoothing**, chosen on 2026-11-04 from six variants on ten cut-out textures:
+0.8 px was razor sharp but kept stair-steps that can shimmer in VR, and smoothing gave clean outlines that stayed
+crisp. **Enhance → Cut-out edges** picks any option for the whole project, whatever the profile: as the profile sets
+it, soft (no crisp edges), crisp 0.8 / 1.5 / 2.5 px, 1.5 px + smoothing, 1.5 px + follow colour, or 1.5 px +
+smoothing + follow colour. **Variants → Cut-out edges** shows them all on the selected texture. In custom profiles,
+the edge width, smoothing and follow-colour controls are under Clean-up.
 Detection uses the original because an enlarged cut-out has so many soft edge texels that it no longer looks like
 one. On 9 cut-out textures (grass, moss, reef, feathers, wing, eye decals, clouds, a door) the half-transparent edge
 texels fell about 10× (for example 17,460 → 1,649), with fidelity the same or better. Blended alpha (clouds of

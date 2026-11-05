@@ -165,13 +165,22 @@ pub struct Cleanup {
     /// inside that range stays.
     pub dering: f32,
     /// Cut-out textures (alpha mostly 0 or 255) get their alpha rebuilt from the original: the same smooth contour,
-    /// re-sharpened to a 1-2 pixel anti-aliased edge instead of the soft enlarged one. Blended alpha is left alone.
+    /// re-sharpened to a narrow anti-aliased edge instead of the soft enlarged one. Blended alpha is left alone.
     pub crisp_cutouts: bool,
+    /// Width of the anti-aliased cut-out edge in output pixels (0.8 = razor sharp but can shimmer in VR; 1.5, the
+    /// default, chosen 2026-11-04 after comparing six settings on ten cut-out textures; 2-3 = softer).
+    pub edge_width: f32,
+    /// Smooths the cut-out outline before the edge is sharpened, in source texels (0 = off, default 0.5): irons out
+    /// the original's pixel staircase on diagonals; too much rounds corners and thins strands.
+    pub edge_smoothing: f32,
+    /// Snaps the cut-out edge to the nearest edge in the upscaled colour (guided filter), so silhouettes line up
+    /// with the painted outline.
+    pub edge_follow_colour: bool,
 }
 
 impl Default for Cleanup {
     fn default() -> Self {
-        Cleanup { dering: 1.0, crisp_cutouts: true }
+        Cleanup { dering: 1.0, crisp_cutouts: true, edge_width: 1.5, edge_smoothing: 0.5, edge_follow_colour: false }
     }
 }
 
@@ -329,11 +338,78 @@ pub struct EnhanceSettings {
     /// filtering in the game cannot pull dark or bright fringes into edges. Off by default: in some textures the
     /// alpha channel is not coverage, and there the hidden colour is visible.
     pub fill_transparent: bool,
+    /// Cut-out edge choice for the whole project, whatever the profile (`FromProfile` = the profile's own setting).
+    pub cutout_edges: CutoutChoice,
 }
 
 impl Default for EnhanceSettings {
     fn default() -> Self {
-        EnhanceSettings { enabled: true, profile: DEFAULT_PROFILE.into(), custom: Vec::new(), fill_transparent: false }
+        EnhanceSettings { enabled: true, profile: DEFAULT_PROFILE.into(), custom: Vec::new(), fill_transparent: false, cutout_edges: CutoutChoice::FromProfile }
+    }
+}
+
+/// The cut-out edge options the user can pick (the variants compared on 2026-11-04), or the profile's own setting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CutoutChoice {
+    FromProfile,
+    /// The soft enlarged edge, as before crisp edges existed.
+    Soft,
+    Crisp08,
+    Crisp15,
+    Crisp25,
+    Smooth15,
+    Follow15,
+    SmoothFollow15,
+}
+
+impl CutoutChoice {
+    pub const ALL: [CutoutChoice; 8] = [
+        CutoutChoice::FromProfile,
+        CutoutChoice::Soft,
+        CutoutChoice::Crisp08,
+        CutoutChoice::Crisp15,
+        CutoutChoice::Crisp25,
+        CutoutChoice::Smooth15,
+        CutoutChoice::Follow15,
+        CutoutChoice::SmoothFollow15,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            CutoutChoice::FromProfile => "As the profile sets it",
+            CutoutChoice::Soft => "Soft (no crisp edges)",
+            CutoutChoice::Crisp08 => "Crisp 0.8 px (razor sharp)",
+            CutoutChoice::Crisp15 => "Crisp 1.5 px",
+            CutoutChoice::Crisp25 => "Crisp 2.5 px (softest crisp)",
+            CutoutChoice::Smooth15 => "1.5 px + smoothing (default)",
+            CutoutChoice::Follow15 => "1.5 px + follow colour",
+            CutoutChoice::SmoothFollow15 => "1.5 px + smoothing + follow colour",
+        }
+    }
+    pub fn hint(self) -> &'static str {
+        match self {
+            CutoutChoice::FromProfile => "Each profile's own cut-out edge setting (built-ins: 1.5 px + smoothing)",
+            CutoutChoice::Soft => "The enlarged edge, about 8 px of blur at x4: no stair-steps, but soft up close",
+            CutoutChoice::Crisp08 => "Sharpest; keeps the original's pixel staircase and can shimmer in VR as you move",
+            CutoutChoice::Crisp15 => "Crisp and steadier than 0.8 px; the staircase is still visible on curves",
+            CutoutChoice::Crisp25 => "Still far crisper than soft, the steadiest in motion",
+            CutoutChoice::Smooth15 => "Clean, smooth outlines without stair-steps; mild rounding of the finest tips",
+            CutoutChoice::Follow15 => "Edges snap to the painted outline in the upscaled colour; keeps tips and corners",
+            CutoutChoice::SmoothFollow15 => "Smoothed outline that then snaps to the painted colour edge",
+        }
+    }
+    /// The clean-up settings this choice stands for, applied over `base` (`None` = keep the profile's).
+    pub fn apply(self, base: &Cleanup) -> Cleanup {
+        let c = |crisp: bool, width: f32, smoothing: f32, follow: bool| Cleanup { crisp_cutouts: crisp, edge_width: width, edge_smoothing: smoothing, edge_follow_colour: follow, ..*base };
+        match self {
+            CutoutChoice::FromProfile => *base,
+            CutoutChoice::Soft => c(false, base.edge_width, base.edge_smoothing, base.edge_follow_colour),
+            CutoutChoice::Crisp08 => c(true, 0.8, 0.0, false),
+            CutoutChoice::Crisp15 => c(true, 1.5, 0.0, false),
+            CutoutChoice::Crisp25 => c(true, 2.5, 0.0, false),
+            CutoutChoice::Smooth15 => c(true, 1.5, 0.5, false),
+            CutoutChoice::Follow15 => c(true, 1.5, 0.0, true),
+            CutoutChoice::SmoothFollow15 => c(true, 1.5, 0.5, true),
+        }
     }
 }
 
@@ -482,7 +558,7 @@ pub fn cache_tag(profile: &Profile, s: &EnhanceSettings, t: &Target) -> String {
     if !s.enabled {
         return "enhance-off".into();
     }
-    format!("enhance-v2:{}:{}:{t:?}", serde_json::to_string(profile).unwrap_or_default(), s.fill_transparent)
+    format!("enhance-v2:{}:{}:{:?}:{t:?}", serde_json::to_string(profile).unwrap_or_default(), s.fill_transparent, s.cutout_edges)
 }
 
 /// A profile with the per-texture tuning applied: exactly what runs.
@@ -504,6 +580,25 @@ pub struct Resolved {
     /// Rebuild the alpha edge from the original when the original is a cut-out (alpha mostly 0 or 255).
     #[serde(default)]
     pub crisp_cutouts: bool,
+    /// How the cut-out edge is rebuilt (width, smoothing, colour guidance).
+    #[serde(default)]
+    pub cutout: CutoutEdge,
+}
+
+/// The cut-out edge settings that apply to one texture.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CutoutEdge {
+    pub width: f32,
+    pub smoothing: f32,
+    pub follow_colour: bool,
+}
+
+impl Default for CutoutEdge {
+    fn default() -> Self {
+        let c = Cleanup::default();
+        CutoutEdge { width: c.edge_width, smoothing: c.edge_smoothing, follow_colour: c.edge_follow_colour }
+    }
 }
 
 impl Resolved {
@@ -570,7 +665,8 @@ pub fn resolve(profile: &Profile, s: &EnhanceSettings, t: &Target, rgba: &[u8]) 
     let dering = if upscaled { profile.cleanup.dering.clamp(0.0, 1.0) } else { 0.0 };
     // Whether the texture is a cut-out is decided from the original in `apply` (an enlarged cut-out has many soft
     // edge texels and no longer looks like one).
-    let crisp = upscaled && profile.cleanup.crisp_cutouts;
+    let cleanup = s.cutout_edges.apply(&profile.cleanup);
+    let crisp = upscaled && cleanup.crisp_cutouts;
     Some(Resolved {
         profile: profile.name.clone(),
         category,
@@ -583,6 +679,7 @@ pub fn resolve(profile: &Profile, s: &EnhanceSettings, t: &Target, rgba: &[u8]) 
         sharp_mips: profile.sharp_mips,
         dering,
         crisp_cutouts: crisp,
+        cutout: CutoutEdge { width: cleanup.edge_width, smoothing: cleanup.edge_smoothing, follow_colour: cleanup.edge_follow_colour },
     })
 }
 
@@ -911,12 +1008,40 @@ fn fill_transparent(w: usize, h: usize, rgba: &mut [u8]) {
 }
 
 /// The cut-out alpha rebuilt from the original's alpha (`ow` x `oh`) at `w` x `h`: a smooth enlargement keeps the
-/// contour (and so the coverage at the 0.5 test), then a steep ramp makes the edge 1-2 pixels wide.
-pub fn crisp_alpha(ow: usize, oh: usize, orig: &[u8], w: usize, h: usize, scale: u32, edge: Edge) -> Vec<u8> {
+/// contour (and so the coverage at the 0.5 test), then a steep ramp makes the edge `e.width` pixels wide.
+///
+/// `e.smoothing` blurs the enlarged alpha first (Gaussian, in source texels); `guide` (the upscale's lightness at the
+/// output size) with `e.follow_colour` moves the outline onto the colour edge with a guided filter; `e.width` is the
+/// width of the final ramp in output pixels. A hard step enlarged with Catmull-Rom rises over about one source texel
+/// (`scale` pixels), so a ramp of `width` pixels spans `width / scale` of alpha.
+pub fn crisp_alpha(ow: usize, oh: usize, orig: &[u8], w: usize, h: usize, scale: u32, edge: Edge, e: &CutoutEdge, guide: Option<&[f32]>) -> Vec<u8> {
     let a: Vec<f32> = orig.chunks_exact(4).map(|p| p[3] as f32 / 255.0).collect();
-    let up = resample::resize(ow, oh, 1, &a, w, h, Filter::CatmullRom, edge);
-    let half = (0.4 / scale.max(1) as f32).clamp(0.05, 0.5);
+    let sc = scale.max(1) as f32;
+    let mut up = resample::resize(ow, oh, 1, &a, w, h, Filter::CatmullRom, edge);
+    if e.smoothing > 0.0 {
+        let k = gaussian_kernel((e.smoothing * sc).max(0.3));
+        up = convolve(w, h, &[&up], &k, edge).remove(0);
+    }
+    if e.follow_colour {
+        if let Some(g) = guide {
+            up = guided_filter(w, h, g, &up, (sc * 0.75).round().max(1.0) as usize, 0.02f32.powi(2), edge);
+        }
+    }
+    let half = (e.width.max(0.25) / (2.0 * sc)).clamp(0.02, 0.5);
     up.par_iter().map(|v| (smoothstep(0.5 - half, 0.5 + half, *v) * 255.0 + 0.5) as u8).collect()
+}
+
+/// He et al.'s guided filter: `p` filtered so its edges follow those of `guide` (both `w` x `h`), window radius `r`.
+fn guided_filter(w: usize, h: usize, guide: &[f32], p: &[f32], r: usize, eps: f32, edge: Edge) -> Vec<f32> {
+    let k = box_kernel(r);
+    let mean = |v: &[f32]| convolve(w, h, &[v], &k, edge).remove(0);
+    let ip: Vec<f32> = guide.iter().zip(p).map(|(a, b)| a * b).collect();
+    let ii: Vec<f32> = guide.iter().map(|a| a * a).collect();
+    let (mi, mp, mip, mii) = (mean(guide), mean(p), mean(&ip), mean(&ii));
+    let a: Vec<f32> = (0..w * h).map(|i| (mip[i] - mi[i] * mp[i]) / ((mii[i] - mi[i] * mi[i]).max(0.0) + eps)).collect();
+    let b: Vec<f32> = (0..w * h).map(|i| mp[i] - a[i] * mi[i]).collect();
+    let (ma, mb) = (mean(&a), mean(&b));
+    (0..w * h).map(|i| ma[i] * guide[i] + mb[i]).collect()
 }
 
 /// Lightness bounds from the original: the 3x3-texel min and max around each source texel, enlarged smoothly to the
@@ -958,7 +1083,11 @@ pub fn apply(w: u32, h: u32, rgba: &[u8], r: &Resolved, original: Option<(u32, u
     if r.crisp_cutouts {
         if let Some((ow, oh, orig)) = original.filter(|(_, _, o)| crate::mips::is_alpha_tested(o) && !has_blended_alpha(o)) {
             stats.crisp_cutout = true;
-            let a = crisp_alpha(ow as usize, oh as usize, orig, w, h, r.scale, edge);
+            let guide: Option<Vec<f32>> = r.cutout.follow_colour.then(|| {
+                let lut = decode_lut();
+                out.par_chunks_exact(4).map(|p| linear_to_oklab([lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]])[0]).collect()
+            });
+            let a = crisp_alpha(ow as usize, oh as usize, orig, w, h, r.scale, edge, &r.cutout, guide.as_deref());
             for (p, v) in out.chunks_exact_mut(4).zip(a) {
                 p[3] = v;
             }
@@ -1089,7 +1218,7 @@ mod tests {
         p.sharpen.enabled = false;
         p.detail.enabled = false;
         p.colour.enabled = false;
-        p.cleanup = Cleanup { dering: 0.0, crisp_cutouts: false };
+        p.cleanup = Cleanup { dering: 0.0, crisp_cutouts: false, ..Cleanup::default() };
         let r = resolve(&p, &EnhanceSettings::default(), &target(Class::Rock), &img).unwrap();
         assert!(r.is_noop());
         assert_eq!(apply(64, 64, &img, &r, None).0, img);
@@ -1412,6 +1541,82 @@ mod tests {
         assert!(out.chunks_exact(4).zip(soft.chunks_exact(4)).all(|(a, b)| a[..3] == b[..3]));
         // Without the original nothing can be rebuilt: alpha stays.
         assert_eq!(apply(n * sc, n * sc, &soft, &r, None).0, soft);
+    }
+
+    #[test]
+    fn the_project_cutout_choice_overrides_any_profile() {
+        let (n, sc) = (16u32, 4u32);
+        let src = disc(n, 5.0);
+        let soft = soft_upscale(n, &src, sc);
+        let t = Target { edge: Edge::Clamp, ..target(Class::Foliage) };
+        let resolve_with = |c: CutoutChoice, p: &Profile| resolve(p, &EnhanceSettings { cutout_edges: c, ..EnhanceSettings::default() }, &t, &soft).unwrap();
+        for p in builtins() {
+            let r = resolve_with(CutoutChoice::Crisp25, &p);
+            assert!(r.crisp_cutouts && r.cutout.width == 2.5 && r.cutout.smoothing == 0.0, "{}", p.name);
+            assert!(!resolve_with(CutoutChoice::Soft, &p).crisp_cutouts, "{}", p.name);
+            let own = resolve_with(CutoutChoice::FromProfile, &p);
+            assert_eq!((own.cutout.width, own.cutout.smoothing), (p.cleanup.edge_width, p.cleanup.edge_smoothing));
+            let both = resolve_with(CutoutChoice::SmoothFollow15, &p);
+            assert!(both.cutout.follow_colour && both.cutout.smoothing == 0.5);
+        }
+        // Each choice gives its own cache tag, so a change re-encodes.
+        let tags: std::collections::HashSet<String> = CutoutChoice::ALL.iter().map(|c| cache_tag(&enhanced(), &EnhanceSettings { cutout_edges: *c, ..EnhanceSettings::default() }, &t)).collect();
+        assert_eq!(tags.len(), CutoutChoice::ALL.len());
+        // Halo removal is not touched by the choice.
+        assert_eq!(CutoutChoice::Soft.apply(&Cleanup::default()).dering, Cleanup::default().dering);
+    }
+
+    #[test]
+    fn the_default_cutout_edge_is_1_5_px_with_mild_smoothing() {
+        let c = Cleanup::default();
+        assert_eq!((c.edge_width, c.edge_smoothing, c.edge_follow_colour), (1.5, 0.5, false));
+        assert!(c.crisp_cutouts);
+    }
+
+    #[test]
+    fn a_wider_cutout_edge_has_more_soft_pixels_and_the_same_coverage() {
+        let (n, sc) = (16u32, 4u32);
+        let src = disc(n, 5.0);
+        let soft = soft_upscale(n, &src, sc);
+        let run = |width: f32, smoothing: f32| {
+            let mut p = enhanced();
+            p.sharpen.enabled = false;
+            p.detail.enabled = false;
+            p.colour.enabled = false;
+            p.cleanup = Cleanup { dering: 0.0, edge_width: width, edge_smoothing: smoothing, ..Cleanup::default() };
+            let r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Foliage) }, &soft).unwrap();
+            apply(n * sc, n * sc, &soft, &r, Some((n, n, &src))).0
+        };
+        let partial = |d: &[u8]| d.chunks_exact(4).filter(|p| p[3] > 16 && p[3] < 240).count();
+        let cover = |d: &[u8]| d.chunks_exact(4).filter(|p| p[3] >= 128).count() as f32;
+        let (a, b, c) = (run(0.8, 0.0), run(1.5, 0.0), run(3.0, 0.0));
+        assert!(partial(&a) < partial(&b) && partial(&b) < partial(&c), "{} {} {}", partial(&a), partial(&b), partial(&c));
+        for x in [&b, &c, &run(1.5, 0.5)] {
+            assert!((cover(x) / cover(&a) - 1.0).abs() < 0.04, "coverage {} vs {}", cover(x), cover(&a));
+        }
+    }
+
+    #[test]
+    fn following_colour_puts_the_cutout_edge_on_the_colour_edge() {
+        // Original 16x16: a cut-out half plane x < 8. The upscale's colour edge sits 2 px right of where the alpha
+        // contour falls (the AI drew the outline slightly differently); with colour guidance the alpha moves to it.
+        let (n, sc) = (16u32, 4u32);
+        let src: Vec<u8> = (0..n * n).flat_map(|i| if i % n < 8 { [200, 60, 40, 255] } else { [0, 0, 0, 0] }).collect();
+        let w = n * sc;
+        let up: Vec<u8> = (0..w * w).flat_map(|i| if i % w < 34 { [200, 60, 40, 255] } else { [0, 0, 0, 255] }).collect();
+        let contour = |d: &[u8]| (0..w as usize).find(|&x| d[x * 4 + 3] < 128).unwrap();
+        let run = |follow: bool| {
+            let mut p = enhanced();
+            p.sharpen.enabled = false;
+            p.detail.enabled = false;
+            p.colour.enabled = false;
+            p.cleanup = Cleanup { dering: 0.0, edge_follow_colour: follow, ..Cleanup::default() };
+            let r = resolve(&p, &EnhanceSettings::default(), &Target { edge: Edge::Clamp, ..target(Class::Foliage) }, &up).unwrap();
+            apply(w, w, &up, &r, Some((n, n, &src))).0
+        };
+        let (plain, guided) = (contour(&run(false)), contour(&run(true)));
+        assert_eq!(plain, 32, "the original's contour");
+        assert!(guided > plain && guided <= 35, "moved towards the colour edge at 34: {guided}");
     }
 
     #[test]
