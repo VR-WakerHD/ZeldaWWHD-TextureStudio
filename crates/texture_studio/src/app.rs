@@ -1737,8 +1737,7 @@ impl App {
         ui.separator();
         egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
             for l in &self.log {
-                let c = if l.contains("FAILED") || l.contains("failed") { Color32::from_rgb(230, 120, 110) } else { Color32::LIGHT_GRAY };
-                ui.label(RichText::new(l).monospace().size(12.0).color(c));
+                ui.label(RichText::new(l).monospace().size(12.0).color(log_colour(l)));
             }
         });
     }
@@ -1985,4 +1984,33 @@ fn open_folder(p: &std::path::Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     let cmd = "xdg-open";
     std::process::Command::new(cmd).arg(p).spawn().map(|_| ())
+}
+
+/// Log line colours: red for real failures, yellow for steps the pipeline recovered from on its own (a model result
+/// that failed the consistency check and stepped down or fell back to Lanczos-3, a batch retried with a smaller
+/// tile), so they do not read as errors; grey otherwise.
+fn log_colour(line: &str) -> Color32 {
+    let recovered = line.contains('→') || line.contains("retrying");
+    if recovered {
+        Color32::from_rgb(230, 200, 90)
+    } else if line.contains("FAILED") || line.contains("failed") {
+        Color32::from_rgb(230, 120, 110)
+    } else {
+        Color32::LIGHT_GRAY
+    }
+}
+
+#[cfg(test)]
+mod log_colour_tests {
+    use super::*;
+
+    #[test]
+    fn recovered_steps_are_yellow_and_real_failures_red() {
+        let yellow = Color32::from_rgb(230, 200, 90);
+        assert_eq!(log_colour("[02:19:47Z] zel_indwp_ia8_04: Real-ESRGAN x4plus anime x4 failed consistency (18.1 dB) → x2"), yellow);
+        assert_eq!(log_colour("[02:19:49Z] zel_indwp_ia8_04: Real-ESRGAN x4plus anime x2 failed consistency (21.1 dB) → Lanczos-3 x4"), yellow);
+        assert_eq!(log_colour("Real-ESRGAN batch failed (out of memory); retrying with tile 128"), yellow);
+        assert_eq!(log_colour("eyeh.2: master missing (not found); run Extract first FAILED"), Color32::from_rgb(230, 120, 110));
+        assert_eq!(log_colour("Upscaling finished"), Color32::LIGHT_GRAY);
+    }
 }
