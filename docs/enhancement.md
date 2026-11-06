@@ -25,7 +25,8 @@ output and an unchanged one never re-encodes.
   colour (unless *Fill colour under transparent texels* is on: cut-out textures only, off by default because in
   some textures alpha is not coverage).
 - **Data textures**: normal maps, masks, ramps, and any one- or two-channel format (BC4, BC5, R8, RG8) are never
-  enhanced, whatever their class says.
+  enhanced, whatever their class says. This includes the two-channel luminance + alpha artwork (eyes, eyebrows):
+  it is upscaled and mip-mapped as an image (see the user guide), but sharpening, colour and clean-up skip it.
 - **Unknown class**: not enhanced (it may be data). Set the class by hand to enhance one.
 - **UI and icons**: lightly sharpened; colours unchanged (×0 colour tuning).
 - **Dimensions, names, hashes, index entries, DDS formats**: unchanged. Enhancement changes pixel values only.

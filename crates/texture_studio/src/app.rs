@@ -1300,13 +1300,13 @@ impl App {
     /// scale, model choice or files change, not every frame).
     fn refresh_compare(&mut self, i: usize) {
         let (Some(p), Some(inv)) = (self.project.clone(), self.inv.clone()) else { return };
-        let (key, scale) = (inv.textures[i].key.clone(), self.compare_scale);
+        let scale = self.compare_scale;
         self.compare_found = self
             .compare_backends
             .iter()
             .filter(|(_, on)| *on)
             .map(|(b, _)| {
-                let found = pipeline::find_upscaled(&p, &b.key(), &key, scale);
+                let found = pipeline::find_upscaled_for(&p, &inv.textures[i], &b.key(), scale);
                 let extra = found
                     .as_ref()
                     .and_then(|(path, _)| pipeline::load_meta(path))

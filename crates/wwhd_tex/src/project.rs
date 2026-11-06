@@ -165,15 +165,23 @@ impl Settings {
         self.only_files.is_empty() || self.only_files.iter().any(|f| file.contains(f.as_str()))
     }
     /// The class's scale setting; `Global` when the class is not listed.
+    /// The class's scale setting; `Global` when the class is not listed. Eyes not listed (settings saved before the
+    /// class existed) follow Character / object colour.
     pub fn scale_choice_for(&self, class: Class) -> ScaleChoice {
-        self.class_scales.iter().find(|(c, _)| *c == class).map(|(_, v)| *v).unwrap_or(ScaleChoice::Global)
+        match self.class_scales.iter().find(|(c, _)| *c == class) {
+            Some((_, v)) => *v,
+            None if class == Class::Eyes => self.scale_choice_for(Class::CharacterAlbedo),
+            None => ScaleChoice::Global,
+        }
     }
+    /// The class's model; the default model when the class is not listed, except Eyes, which then follow
+    /// Character / object colour.
     pub fn backend_for(&self, class: Class) -> BackendChoice {
-        self.backends
-            .iter()
-            .find(|(c, _)| *c == class)
-            .map(|(_, b)| b.clone())
-            .unwrap_or_else(|| self.default_backend.clone())
+        match self.backends.iter().find(|(c, _)| *c == class) {
+            Some((_, b)) => b.clone(),
+            None if class == Class::Eyes => self.backend_for(Class::CharacterAlbedo),
+            None => self.default_backend.clone(),
+        }
     }
 }
 
@@ -292,5 +300,26 @@ mod project_root_tests {
         assert!(p.root.is_absolute(), "{}", p.root.display());
         assert!(!p.root.to_string_lossy().starts_with(r"\?\"));
         let _ = std::fs::remove_dir_all(&p.root);
+    }
+}
+
+#[cfg(test)]
+mod eyes_settings_tests {
+    use super::*;
+    use crate::upscale::BackendChoice;
+
+    #[test]
+    fn eyes_follow_character_until_set_on_their_own() {
+        let mut s = Settings { backends: vec![(Class::CharacterAlbedo, BackendChoice::Custom("4x-AnimeSharp".into()))], ..Settings::default() };
+        s.class_scales.retain(|(c, _)| *c != Class::Eyes);
+        s.class_scales.retain(|(c, _)| *c != Class::CharacterAlbedo);
+        s.class_scales.push((Class::CharacterAlbedo, ScaleChoice::X(8)));
+        assert_eq!(s.backend_for(Class::Eyes), BackendChoice::Custom("4x-AnimeSharp".into()));
+        assert_eq!(s.scale_choice_for(Class::Eyes), ScaleChoice::X(8));
+        s.backends.push((Class::Eyes, BackendChoice::RealEsrgan("realesrgan-x4plus-anime".into())));
+        s.class_scales.push((Class::Eyes, ScaleChoice::X(4)));
+        assert_eq!(s.backend_for(Class::Eyes), BackendChoice::RealEsrgan("realesrgan-x4plus-anime".into()));
+        assert_eq!(s.scale_choice_for(Class::Eyes), ScaleChoice::X(4));
+        assert_eq!(s.backend_for(Class::Water), s.default_backend, "other classes unchanged");
     }
 }

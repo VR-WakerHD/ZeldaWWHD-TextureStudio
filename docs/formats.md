@@ -61,6 +61,13 @@ applied unconditionally. Latte follows the non-R6xx paths; with them off, every 
 Masters keep the stored channels (needed for exact re-encoding). Previews apply the FTEX component selector
 (BFRES) or luminance/alpha semantics (BFLIM BC4/BC5/R8/RG8).
 
+BC5 is not only for normal maps here: 635 of the 636 BFRES BC5 textures have component selector `[0, 0, 0, 1]`
+(R to RGB, G to alpha), a luminance + alpha image (eyes, eyebrows, mouths, cursors, numbers, crack decals). Only
+`himo_nml` (`[0, 1, 4, 5]`) is a normal map. `classify::is_luminance_alpha` tells them apart; the upscale and mip
+steps work on the view (L, L, L, A) and pack the result back to (L, A). The renderer applies the game's own
+selector to replacement images too (`sampled_texture_view` with the descriptor's DST_SEL), so the packed layout is
+what it expects.
+
 ## Not supported
 
 - Cube maps and array textures (detected, kept original).

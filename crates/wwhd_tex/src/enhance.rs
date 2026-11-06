@@ -444,6 +444,7 @@ impl EnhanceSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Category {
     Character,
+    Eyes,
     Environment,
     Vegetation,
     Water,
@@ -461,6 +462,7 @@ impl Category {
     pub fn label(self) -> &'static str {
         match self {
             Category::Character => "Character artwork",
+            Category::Eyes => "Eyes",
             Category::Environment => "Environment artwork",
             Category::Vegetation => "Vegetation",
             Category::Water => "Water",
@@ -500,6 +502,7 @@ pub fn category(class: Class, format: u32, rgba: &[u8]) -> Category {
         Class::NormalMap | Class::Mask | Class::Ramp => return Category::Data,
         Class::Unknown => return Category::Unknown,
         Class::CharacterAlbedo => Category::Character,
+        Class::Eyes => Category::Eyes,
         Class::EnvironmentAlbedo | Class::Terrain => Category::Environment,
         Class::Foliage => Category::Vegetation,
         Class::Water => Category::Water,
@@ -527,6 +530,9 @@ pub fn class_tuning(c: Category) -> Tuning {
     let t = |sharpen, detail, colour| Tuning { sharpen, detail, colour };
     match c {
         Category::Character => t(1.0, 0.8, 1.0),
+        // Eyes: small, high-contrast, exact colours matter (an iris must keep its hue): gentle sharpening, no
+        // invented detail, colours untouched.
+        Category::Eyes => t(0.6, 0.0, 0.0),
         Category::Environment => t(1.0, 1.0, 1.0),
         Category::Vegetation => t(0.75, 0.8, 1.0),
         Category::Water => t(0.5, 0.4, 0.6),

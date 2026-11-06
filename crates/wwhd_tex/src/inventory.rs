@@ -67,7 +67,29 @@ pub struct Inventory {
 
 impl Inventory {
     pub fn load(path: &Path) -> Result<Inventory> {
-        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        let mut inv: Inventory = serde_json::from_slice(&std::fs::read(path)?)?;
+        inv.reclassify_stale();
+        Ok(inv)
+    }
+    /// Classify again what older scans got wrong or did not know: textures classed as normal maps that are not
+    /// (two-channel luminance + alpha; colour textures named "normal"), and eyes (a class added later). Other
+    /// records keep their class (it may carry a pixel-based refinement); manual choices are always kept.
+    /// Returns how many records changed.
+    pub fn reclassify_stale(&mut self) -> usize {
+        let mut n = 0;
+        for t in &mut self.textures {
+            if t.classification.manual {
+                continue;
+            }
+            let new = classify::classify_texture(t.kind, &t.id.location.file, &t.id.name, t.surface.format, t.surface.width, t.surface.height, t.comp_sel);
+            let misread = t.classification.class == classify::Class::NormalMap && new.class != classify::Class::NormalMap;
+            let eyes = new.class == classify::Class::Eyes && t.classification.class != classify::Class::Eyes;
+            if misread || eyes {
+                t.classification = new;
+                n += 1;
+            }
+        }
+        n
     }
     pub fn save(&self, path: &Path) -> Result<()> {
         crate::project::write_atomic(path, &serde_json::to_vec(self)?)
@@ -166,7 +188,7 @@ pub fn scan(root: &Path, scope: &ScanScope, progress: &Progress) -> Result<Inven
                                 for t in list {
                                     let g = texture::gate(&t, leaf);
                                     let decodable = t.surface.depth <= 1 && crate::gx2::codec(t.surface.format).is_ok();
-                                    let cl = classify::classify(kind, &rel, &t.id.name, t.surface.format, t.surface.width, t.surface.height);
+                                    let cl = classify::classify_texture(kind, &rel, &t.id.name, t.surface.format, t.surface.width, t.surface.height, t.comp_sel);
                                     textures.push(TextureRecord {
                                         key: content_key(&t.data_hash, &t.surface),
                                         id: t.id,
@@ -218,4 +240,38 @@ pub fn scan(root: &Path, scope: &ScanScope, progress: &Progress) -> Result<Inven
         inv.errors.len()
     ));
     Ok(inv)
+}
+
+#[cfg(test)]
+mod lum_alpha_migration_tests {
+    use super::*;
+    use crate::classify::Class;
+
+    fn rec(name: &str, comp_sel: [u8; 4], class: Class, manual: bool) -> TextureRecord {
+        TextureRecord {
+            id: TextureId { location: container::AssetLocation { file: "content/Common/Object/Link.szs".into(), inner: vec![] }, index: 0, name: name.into() },
+            kind: LeafKind::Bfres,
+            surface: Gx2Surface { format: 0x35, width: 64, height: 64, depth: 1, mip_count: 1, ..Default::default() },
+            comp_sel,
+            data_hash: String::new(),
+            key: name.into(),
+            gate_ok: true,
+            gate_detail: String::new(),
+            decodable: true,
+            classification: Classification { class, confidence: 0.6, reason: "BC5 two-channel texture (normal maps use BC5)".into(), manual },
+        }
+    }
+
+    #[test]
+    fn old_inventories_reclassify_misread_normal_maps_and_eyes_but_keep_normal_maps_and_manual_choices() {
+        let mut inv = Inventory {
+            textures: vec![rec("eyeh.2", [0, 0, 0, 1], Class::NormalMap, false), rec("himo_nml", [0, 1, 4, 5], Class::NormalMap, false), rec("mayuh.1", [0, 0, 0, 1], Class::NormalMap, true)],
+            ..Default::default()
+        };
+        assert_eq!(inv.reclassify_stale(), 1);
+        assert_eq!(inv.textures[0].classification.class, Class::Eyes);
+        assert_eq!(inv.textures[1].classification.class, Class::NormalMap, "a real normal map");
+        assert_eq!(inv.textures[2].classification.class, Class::NormalMap, "the user's choice");
+        assert_eq!(inv.reclassify_stale(), 0, "once");
+    }
 }

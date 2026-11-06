@@ -182,7 +182,7 @@ pub fn run(p: &Project, s: &Settings, d: &Decisions, names: Option<Vec<String>>,
         if let (Some((img, sharp)), Some(fmt)) = (enhanced_img, runtime_pack::pack_format(t.surface.format, cl.class)) {
             let started = std::time::Instant::now();
             let count = mips::upscaled_mip_count(t.surface.mip_count, achieved).min(runtime_pack::max_levels(uw, uh));
-            let mode = pipeline::mip_mode(cl.class, t.surface.format, &img);
+            let mode = pipeline::mip_mode(cl.class, t.surface.format, &img); // colour textures only (stores_rgb)
             let levels: Vec<Vec<u8>> = mips::chain_with(uw, uh, img, count, mode, sharp.then_some(target.edge)).into_iter().map(|l| l.2).collect();
             let _ = runtime_pack::write_dds(uw, uh, fmt, &levels)?;
             encode_ms = started.elapsed().as_secs_f32() * 1000.0;

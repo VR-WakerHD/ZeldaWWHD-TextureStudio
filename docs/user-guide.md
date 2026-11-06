@@ -76,7 +76,17 @@ its own rebuilt copy.
    `Common/ProgramTexture/ProgramTexture.szs` and everything in `Common/Pack/`. Both are in Settings → Packages
    and memory budget. The **runtime pack** has neither limit.
 2. **Upscale**: colour classes use Real-ESRGAN x4plus-anime by default, UI and lettering Lanczos-3, masks
-   Mitchell, normal maps Catmull-Rom on vectors (never AI). Colour goes to the model with a 16 px wrapped
+   Mitchell, normal maps Catmull-Rom on vectors (never AI). **Two-channel luminance + alpha** textures (BC5/RG8
+   whose component selector shows R as colour and G as alpha: eyes, eyebrows, mouths, cursors, numbers, cracks;
+   635 of the game's 636 BFRES BC5 textures) are artwork, not normal maps: they are classed by name and location
+   like colour textures, upscaled and mip-mapped as the grey image with alpha the game shows (L, L, L, A), and
+   packed back to the two stored channels. Upscales of them made before this (by the normal-map path, which
+   turned black and white into greys and transparency into a faint film) are not used and are made again; the
+   same goes for colour textures with "normal" in their name (`Ganonjo_NormalDoor_cl`), which are no longer
+   taken for normal maps (normal maps are never sRGB). **Eyes** (names with eye, hitomi or pupil; 338 textures)
+   are a class of their own in Settings → Models per class: until you set them they use Character / object
+   colour's model and scale; enhancement treats them gently (60 % sharpening, no detail lift, colours unchanged).
+   Colour goes to the model with a 16 px wrapped
    border (clamped for UI) so tiling textures stay seamless; alpha is resized separately. Each AI result is
    shrunk back and compared with the source; below 22 dB it is discarded and Lanczos-3 is used (noted).
    A failing model run is retried with a smaller tile, then image by image, then with Lanczos-3.

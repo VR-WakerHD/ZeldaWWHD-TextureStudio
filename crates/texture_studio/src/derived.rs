@@ -142,7 +142,7 @@ pub fn scan_upscaled(p: &Project, inv: &Inventory, unique: &[usize], plans: &[Pl
     for &i in unique {
         let pl = &plans[i];
         if pl.upscales() {
-            found[i] = pipeline::find_upscaled(p, &pl.backend.key(), &inv.textures[i].key, pl.scale);
+            found[i] = pipeline::find_upscaled_for(p, &inv.textures[i], &pl.backend.key(), pl.scale);
         }
         if p.master_path(&inv.textures[i].key).exists() {
             extracted += 1;

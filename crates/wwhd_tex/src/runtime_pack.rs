@@ -409,7 +409,7 @@ fn export_runtime_with(
             skip(&mut report, "not reviewed".into());
             continue;
         }
-        match pipeline::find_upscaled(p, &plan.backend.key(), &t.key, plan.scale) {
+        match pipeline::find_upscaled_for(p, t, &plan.backend.key(), plan.scale) {
             Some((png, scale)) => cands.push(Candidate { record: i, fmt, png, scale }),
             None => skip(&mut report, "not upscaled yet".into()),
         }
@@ -600,8 +600,7 @@ fn encode_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, c: &Can
         }
         // Original levels plus one per doubling, never more than the size allows.
         let count = mips::upscaled_mip_count(t.surface.mip_count, c.scale).min(max_levels(w, hh));
-        let mode = pipeline::mip_mode(class, t.surface.format, &rgba);
-        let levels: Vec<Vec<u8>> = mips::chain_with(w, hh, rgba, count, mode, sharp).into_iter().map(|(_, _, l)| l).collect();
+        let levels: Vec<Vec<u8>> = pipeline::build_levels(t, class, w, hh, rgba, count, sharp).into_iter().map(|(_, _, l)| l).collect();
         write_atomic(&cache, &write_dds(w, hh, c.fmt, &levels)?)?;
     }
     let bytes = std::fs::metadata(&cache)?.len();

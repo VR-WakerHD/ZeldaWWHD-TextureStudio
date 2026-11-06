@@ -58,6 +58,47 @@ pub fn display_map(t: &TextureRecord) -> [u8; 4] {
     }
 }
 
+/// Whether record `t` is a two-channel luminance + alpha texture (see [`classify::is_luminance_alpha`]). Such
+/// textures are stored as (L, A) in R and G; every processing step that treats them as images (AI and filter
+/// upscaling, mip generation) works on the view (L, L, L, A), and the result is packed back to (L, A) for encoding.
+pub fn is_luminance_alpha(t: &TextureRecord) -> bool {
+    classify::is_luminance_alpha(t.kind, t.surface.format, t.comp_sel)
+}
+
+/// Stored (L, A, -, -) to the view the game shows: (L, L, L, A).
+pub fn lum_alpha_to_view(rgba: &mut [u8]) {
+    for p in rgba.chunks_exact_mut(4) {
+        let (l, a) = (p[0], p[1]);
+        p.copy_from_slice(&[l, l, l, a]);
+    }
+}
+
+/// The view (L, L, L, A) back to the stored layout (L, A, 0, 255), as a BC5/RG8 decode gives it. A model may tint a
+/// grey image slightly; the three colour channels are averaged.
+pub fn lum_alpha_from_view(rgba: &mut [u8]) {
+    for p in rgba.chunks_exact_mut(4) {
+        let l = ((p[0] as u32 + p[1] as u32 + p[2] as u32 + 1) / 3) as u8;
+        let a = p[3];
+        p.copy_from_slice(&[l, a, 0, 255]);
+    }
+}
+
+/// Upscale records of textures processed as images (not as normal vectors) carry this layout version. Textures
+/// earlier builds misread as normal maps ([`classify::misread_as_normal_map_before`]: luminance + alpha eyes, a
+/// colour door named "normal") went through vector renormalisation, which turned black and white into greys and
+/// shifted colours; their older upscales are made again.
+pub const IMAGE_LAYOUT: u32 = 1;
+
+/// [`find_upscaled`] for texture record `t`: also rejects an upscale of a once-misread texture made before
+/// [`IMAGE_LAYOUT`].
+pub fn find_upscaled_for(p: &Project, t: &TextureRecord, backend_key: &str, scale: u32) -> Option<(PathBuf, u32)> {
+    let found = find_upscaled(p, backend_key, &t.key, scale)?;
+    if classify::misread_as_normal_map_before(t.kind, &t.id.name, t.surface.format, t.comp_sel) && load_meta(&found.0).is_none_or(|m| m.layout < IMAGE_LAYOUT) {
+        return None;
+    }
+    Some(found)
+}
+
 pub fn apply_display_map(rgba: &mut [u8], map: [u8; 4]) {
     if map == [0, 1, 2, 3] {
         return;
@@ -142,6 +183,8 @@ pub fn extract(p: &Project, inv: &mut Inventory, progress: &Progress) -> Result<
                         save_png(&thumb_path(p, &t.key), tw, th, &small)
                     });
                     match r {
+                        // Luminance + alpha textures are grey by design: no pixel refinement.
+                        Ok(()) if is_luminance_alpha(t) => {}
                         Ok(()) => {
                             refined.lock().unwrap().insert(t.key.clone(), classify::refine_with_pixels(t.classification.clone(), rgba));
                         }
@@ -180,6 +223,9 @@ pub struct UpscaleMeta {
     #[serde(default)]
     pub steps: Vec<String>,
     pub seconds: f32,
+    /// [`IMAGE_LAYOUT`] when the texture was processed as an image (not as normal vectors); 0 in older records.
+    #[serde(default)]
+    pub layout: u32,
     pub note: String,
     /// PSNR of the result shrunk back to the source size against the source.
     #[serde(default)]
@@ -290,7 +336,7 @@ pub fn all_upscale_tasks(inv: &Inventory, s: &Settings, d: &Decisions) -> Vec<Up
 /// Stage 2: upscale tasks whose results are not cached yet.
 pub fn upscale(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, tasks: &[UpscaleTask], progress: &Progress) -> Result<()> {
     let tools = Tools { dir: s.tools_dir.clone() };
-    let todo: Vec<&UpscaleTask> = tasks.iter().filter(|t| find_upscaled(p, &t.backend.key(), &t.key, t.scale).is_none()).collect();
+    let todo: Vec<&UpscaleTask> = tasks.iter().filter(|t| find_upscaled_for(p, &inv.textures[t.record], &t.backend.key(), t.scale).is_none()).collect();
     progress.begin("Upscaling", tasks.len());
     progress.steps(tasks.len() - todo.len());
     let scratch = p.root.join("cache/tmp");
@@ -318,7 +364,10 @@ pub fn upscale(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, tasks:
             for t in chunk {
                 let rec = &inv.textures[t.record];
                 match load_png(&p.master_path(&t.key)) {
-                    Ok((w, h, rgba)) => {
+                    Ok((w, h, mut rgba)) => {
+                        if is_luminance_alpha(rec) {
+                            lum_alpha_to_view(&mut rgba);
+                        }
                         jobs.push(upscale::Job {
                             name: rec.id.name.clone(),
                             w,
@@ -334,8 +383,14 @@ pub fn upscale(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, tasks:
             }
             let results = run_with_recovery(&backend, &tools, s, &scratch, &jobs, &tasks_ok, inv, d, progress)?;
             let secs = started.elapsed().as_secs_f32() / tasks_ok.len().max(1) as f32;
-            for (t, r) in tasks_ok.iter().zip(results) {
+            for (t, mut r) in tasks_ok.iter().zip(results) {
                 debug_assert_eq!(r.out.w % r.achieved, 0);
+                let rec = &inv.textures[t.record];
+                let lum_alpha = is_luminance_alpha(rec);
+                let as_vectors = d.classification(rec).class == Class::NormalMap && !lum_alpha;
+                if lum_alpha {
+                    lum_alpha_from_view(&mut r.out.rgba);
+                }
                 let path = p.upscaled_path(&t.backend.key(), &t.key, r.achieved);
                 let meta = UpscaleMeta {
                     backend: t.backend.clone(),
@@ -347,6 +402,7 @@ pub fn upscale(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, tasks:
                     seconds: secs,
                     note: r.note,
                     consistency_db: r.consistency_db,
+                    layout: if as_vectors { 0 } else { IMAGE_LAYOUT },
                 };
                 match save_png(&path, r.out.w, r.out.h, &r.out.rgba).and_then(|_| write_atomic(&meta_path(&path), &serde_json::to_vec(&meta)?)) {
                     Ok(()) => progress.step(),
@@ -392,7 +448,8 @@ fn run_with_recovery(
 ) -> Result<Vec<Recovered>> {
     let finish = |i: usize, o: upscale::Output| -> upscale::Output {
         let t = tasks[i];
-        if d.classification(&inv.textures[t.record]).class != Class::NormalMap {
+        // Only real normal maps: luminance + alpha is never treated as vectors, whatever its class.
+        if d.classification(&inv.textures[t.record]).class != Class::NormalMap || is_luminance_alpha(&inv.textures[t.record]) {
             return o;
         }
         let f = inv.textures[t.record].surface.format;
@@ -557,6 +614,23 @@ pub fn mip_mode(class: Class, format: u32, rgba: &[u8]) -> MipMode {
     }
 }
 
+/// The mip chain an export writes for record `t` from its (enhanced) level 0 in the stored layout. Luminance + alpha
+/// textures are filtered as the image the game shows, (L, L, L, A) with real alpha (coverage kept for cut-outs),
+/// and packed back to (L, A); everything else uses [`mip_mode`].
+pub fn build_levels(t: &TextureRecord, class: Class, w: u32, h: u32, mut rgba: Vec<u8>, count: u32, sharp: Option<Edge>) -> Vec<(u32, u32, Vec<u8>)> {
+    if !is_luminance_alpha(t) {
+        let mode = mip_mode(class, t.surface.format, &rgba);
+        return mips::chain_with(w, h, rgba, count, mode, sharp);
+    }
+    lum_alpha_to_view(&mut rgba);
+    let mode = MipMode::Colour { srgb: false, alpha_test: mips::is_alpha_tested(&rgba) };
+    let mut levels = mips::chain_with(w, h, rgba, count, mode, sharp);
+    for (_, _, l) in &mut levels {
+        lum_alpha_from_view(l);
+    }
+    levels
+}
+
 /// Edge addressing for a texture: layout images are clamped, 3D textures tile.
 pub fn edge_of(t: &TextureRecord) -> Edge {
     if t.kind == LeafKind::Bflim { Edge::Clamp } else { Edge::Wrap }
@@ -611,7 +685,7 @@ fn build_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, i: usize
     let t = &inv.textures[i];
     let class = d.classification(t).class;
     // The scale the upscale really reached (it may have stepped down from the plan).
-    let (png, scale) = find_upscaled(p, &plan.backend.key(), &t.key, plan.scale).ok_or_else(|| Error::Format("upscaled image missing".into()))?;
+    let (png, scale) = find_upscaled_for(p, t, &plan.backend.key(), plan.scale).ok_or_else(|| Error::Format("upscaled image missing".into()))?;
     let png_bytes = std::fs::read(&png).map_err(|e| Error::Format(format!("upscaled image missing: {e}")))?;
     // Encoded surfaces are cached by everything that determines them, including
     // the upscaled image's bytes, so shared textures encode once.
@@ -639,8 +713,7 @@ fn build_one(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, i: usize
         }
     }
     let count = mips::upscaled_mip_count(t.surface.mip_count, scale);
-    let mode = mip_mode(class, t.surface.format, &rgba);
-    let levels = mips::chain_with(w, h, rgba, count, mode, sharp);
+    let levels = build_levels(t, class, w, h, rgba, count, sharp);
     let rep = texture::build_replacement(&info_of(t), &levels)?;
     // Validate: decode what will be written and compare with the intended image.
     let mut check = info_of(t);
@@ -714,7 +787,7 @@ pub fn export(p: &Project, s: &Settings, inv: &Inventory, d: &Decisions, progres
         if r.status == ReviewStatus::Rejected || (r.status == ReviewStatus::Pending && !s.export_unreviewed) {
             continue;
         }
-        if find_upscaled(p, &pl.backend.key(), &t.key, pl.scale).is_none() {
+        if find_upscaled_for(p, t, &pl.backend.key(), pl.scale).is_none() {
             report.textures_skipped.push(format!("{}: not upscaled yet", t.id.key()));
             continue;
         }
@@ -1144,6 +1217,7 @@ mod tests {
             seconds: 0.0,
             note: String::new(),
             consistency_db: 40.0,
+            layout: 0,
         };
         std::fs::write(meta_path(&png), serde_json::to_vec(&meta).unwrap()).unwrap();
         assert_eq!(find_upscaled(&p, be, &hash, 32), Some((png.clone(), 8)));
@@ -1152,6 +1226,124 @@ mod tests {
         assert!(!png.exists() && !meta_path(&png).exists());
         assert_eq!(find_upscaled(&p, be, &hash, 32), None, "regenerate really starts over");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- luminance + alpha (grey eye) regression tests -------------------------------------------------------------
+
+    /// A 16x16 eye in the stored BC5 layout (L, A, 0, 255): grey iris (r <= 7), black pupil (r <= 2), white 2x2 highlight, a cut-out
+    /// outline, and colour (L = 200) under the fully transparent surround.
+    fn stored_eye() -> Vec<u8> {
+        let mut v = Vec::new();
+        for y in 0..16 {
+            for x in 0..16 {
+                let r = ((x as f32 - 7.5).powi(2) + (y as f32 - 7.5).powi(2)).sqrt();
+                let highlight = (5..7).contains(&x) && (5..7).contains(&y);
+                let (l, a) = if r > 7.0 { (200, 0) } else if highlight { (255, 255) } else if r <= 2.0 { (0, 255) } else { (128, 255) };
+                v.extend_from_slice(&[l, a, 0, 255]);
+            }
+        }
+        v
+    }
+
+    fn eye_record(key: &str) -> TextureRecord {
+        TextureRecord {
+            id: texture::TextureId { location: container::AssetLocation { file: "content/Common/Pack/permanent_3d.pack".into(), inner: vec![] }, index: 0, name: "eyeh.2".into() },
+            kind: LeafKind::Bfres,
+            surface: gx2::Gx2Surface { format: 0x35, width: 16, height: 16, depth: 1, mip_count: 5, ..Default::default() },
+            comp_sel: [0, 0, 0, 1],
+            data_hash: key.into(),
+            key: key.into(),
+            gate_ok: true,
+            gate_detail: String::new(),
+            decodable: true,
+            classification: classify::classify_texture(LeafKind::Bfres, "content/Common/Pack/permanent_3d.pack", "eyeh.2", 0x35, 16, 16, [0, 0, 0, 1]),
+        }
+    }
+
+    /// (stored R, stored G) = (luminance, alpha) at fractional position (fx, fy) of a square image `w` wide.
+    fn at(w: u32, img: &[u8], fx: f32, fy: f32) -> [u8; 2] {
+        let (x, y) = ((fx * w as f32) as usize, (fy * w as f32) as usize);
+        let (x, y) = (x.min(w as usize - 1), y.min(w as usize - 1));
+        let p = &img[(y * w as usize + x) * 4..][..4];
+        [p[0], p[1]]
+    }
+
+    #[test]
+    fn grey_eye_regression_upscaling_keeps_black_white_and_transparency() {
+        let root = std::env::temp_dir().join(format!("wwhd-lum-alpha-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let p = Project::open(&root).unwrap();
+        let t = eye_record(&"e1".repeat(16));
+        assert_eq!(t.classification.class, Class::Eyes, "artwork, not a normal map");
+        save_png(&p.master_path(&t.key), 16, 16, &stored_eye()).unwrap();
+        let inv = Inventory { textures: vec![t.clone()], ..Default::default() };
+        let backend = BackendChoice::Filter(Filter::CatmullRom);
+        let task = UpscaleTask { key: t.key.clone(), record: 0, scale: 4, backend: backend.clone() };
+        upscale(&p, &Settings::default(), &inv, &Decisions::default(), &[task], &Progress::default()).unwrap();
+        let (png, sc) = find_upscaled_for(&p, &t, &backend.key(), 4).expect("upscaled, with the current layout");
+        assert_eq!(sc, 4);
+        let (w, h, up) = load_png(&png).unwrap();
+        assert_eq!((w, h), (64, 64));
+        assert!(up.chunks_exact(4).all(|p| p[2] == 0 && p[3] == 255), "stored layout, as a BC5 decode gives it");
+        let [pupil, pa] = at(w, &up, 0.47, 0.5);
+        let [white, wa] = at(w, &up, 0.375, 0.375);
+        let [iris, _] = at(w, &up, 0.78, 0.5);
+        assert!(pupil <= 3 && pa == 255, "pupil stays black and opaque: {pupil} {pa}");
+        assert!(white >= 245 && wa == 255, "highlight stays white: {white} {wa}");
+        assert!((iris as i32 - 128).abs() <= 3, "iris keeps its grey: {iris}");
+        // The transparent surround stays transparent (no grey film) and keeps its hidden value.
+        let corner: Vec<&[u8]> = up.chunks_exact(4).enumerate().filter(|(i, _)| (i % 64) < 6 && (i / 64) < 6).map(|(_, p)| p).collect();
+        assert!(corner.iter().all(|p| p[1] == 0 && p[0] == 200), "corner {:?}", corner[0]);
+        // What the old normal-map path did to the same eye: black up to ~38, white down to ~230, hidden alpha 0 up to ~17.
+        let old = upscale::upscale_normal_map(16, 16, &stored_eye(), 4, true, false, Filter::CatmullRom);
+        let [old_pupil, _] = at(w, &old, 0.47, 0.5);
+        let [old_white, _] = at(w, &old, 0.375, 0.375);
+        let [_, old_corner_a] = at(w, &old, 0.02, 0.02);
+        assert!(old_pupil > 30 && old_white < 240 && old_corner_a > 10, "the defect this guards against: {old_pupil} {old_white} {old_corner_a}");
+        // An upscale made before the fix (record without a layout) is not used: it is made again.
+        let mut m = load_meta(&png).unwrap();
+        assert_eq!(m.layout, IMAGE_LAYOUT);
+        m.layout = 0;
+        std::fs::write(meta_path(&png), serde_json::to_vec(&m).unwrap()).unwrap();
+        assert!(find_upscaled_for(&p, &t, &backend.key(), 4).is_none());
+        assert!(find_upscaled(&p, &backend.key(), &t.key, 4).is_some(), "the plain lookup is unchanged");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn grey_eye_regression_mips_keep_contrast_and_follow_a_box_filter() {
+        let t = eye_record(&"e2".repeat(16));
+        let base = resample::resize_rgba8(16, 16, &stored_eye(), 64, 64, Filter::Nearest, Edge::Clamp);
+        let levels = build_levels(&t, t.classification.class, 64, 64, base.clone(), 7, None);
+        assert_eq!(levels.len(), 7);
+        // Reference: a per-channel box filter of the stored layout.
+        let reference = mips::chain_with(64, 64, base.clone(), 7, MipMode::Data, None);
+        for ((w, _, l), (_, _, r)) in levels.iter().zip(&reference).take(5) {
+            assert!(l.chunks_exact(4).all(|p| p[2] == 0 && p[3] == 255), "stored layout at {w}");
+            let opaque: Vec<(u8, u8)> = l.chunks_exact(4).zip(r.chunks_exact(4)).filter(|(_, b)| b[1] == 255).map(|(a, b)| (a[0], b[0])).collect();
+            let dl = opaque.iter().map(|(a, b)| (*a as f32 - *b as f32).abs()).sum::<f32>() / opaque.len().max(1) as f32;
+            assert!(dl <= 1.0, "luminance follows a box filter at {w}: mean |dL| {dl}");
+            if *w >= 16 {
+                let (lo, hi) = (opaque.iter().map(|p| p.0).min().unwrap(), opaque.iter().map(|p| p.0).max().unwrap());
+                assert!(lo <= 2 && hi >= 250, "black and white survive at {w}: {lo}..{hi}");
+            }
+        }
+        // The old normal-map mips capped white at ~218 below the top level.
+        let old = mips::chain_with(64, 64, base, 3, MipMode::Normal { two_channel: true, snorm: false }, None);
+        assert!(old[1].2.chunks_exact(4).filter(|p| p[1] > 200).all(|p| p[0] < 225), "the defect this guards against");
+    }
+
+    #[test]
+    fn luminance_alpha_view_round_trips() {
+        let mut v = stored_eye();
+        lum_alpha_to_view(&mut v);
+        assert!(v.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]));
+        lum_alpha_from_view(&mut v);
+        assert_eq!(v, stored_eye());
+        // A slightly tinted model result averages to its grey.
+        let mut tinted = vec![100, 103, 97, 255];
+        lum_alpha_from_view(&mut tinted);
+        assert_eq!(tinted, [100, 255, 0, 255]);
     }
 
     #[test]

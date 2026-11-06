@@ -462,6 +462,7 @@ impl App {
                 ui.end_row();
                 for c in [
                     enhance::Category::Character,
+                    enhance::Category::Eyes,
                     enhance::Category::Environment,
                     enhance::Category::Vegetation,
                     enhance::Category::Water,
@@ -508,7 +509,7 @@ impl App {
         // The upscale to preview: the planned one, else any cached ×4 / ×2.
         let backend = plan.as_ref().map(|pl| pl.backend.clone()).filter(|b| *b != BackendChoice::Native).unwrap_or_else(|| self.settings.default_backend.clone());
         let scale = plan.as_ref().map(|pl| pl.scale).filter(|s| *s > 1).unwrap_or(self.settings.scale.max(2));
-        let found = pipeline::find_upscaled(&p, &backend.key(), &t.key, scale);
+        let found = pipeline::find_upscaled_for(&p, t, &backend.key(), scale);
         let Some((png, achieved)) = found else {
             ui.label(format!("No {} ×{scale} upscale of this texture yet: run Upscale (or Reprocess in Assets) first.", backend.label()));
             return;
@@ -659,7 +660,7 @@ impl App {
                     VariantSet::Models => upscale::catalogue_with(&tools)
                         .into_iter()
                         .filter(|b| b.is_ai())
-                        .filter_map(|b| pipeline::find_upscaled(&p, &b.key(), &t.key, scale).filter(|(_, a)| *a == achieved).map(|(path, _)| (b.label(), mk(Some(&base), false, &path))))
+                        .filter_map(|b| pipeline::find_upscaled_for(&p, t, &b.key(), scale).filter(|(_, a)| *a == achieved).map(|(path, _)| (b.label(), mk(Some(&base), false, &path))))
                         .collect(),
                 };
                 if list.is_empty() {

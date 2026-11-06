@@ -91,6 +91,9 @@ pub fn recommended(class: Class) -> Vec<BackendChoice> {
     let custom = |s: &str| BackendChoice::Custom(s.into());
     match class {
         Class::CharacterAlbedo => vec![anime, custom("4x-AnimeSharp"), custom("4x-IllustrationJaNai"), cugan],
+        // Small high-contrast shapes: crisp line models first, a plain filter when a model adds detail that was
+        // not painted.
+        Class::Eyes => vec![custom("4x-AnimeSharp"), anime, cugan, BackendChoice::Filter(Filter::Lanczos3)],
         Class::EnvironmentAlbedo | Class::Terrain | Class::Rock | Class::Wood => vec![anime, cugan, custom("4x-IllustrationJaNai"), custom("4x-UltraSharp")],
         Class::Foliage => vec![anime, cunet(0), cugan],
         Class::Water | Class::Sky => vec![cunet(0), cugan, anime],
